@@ -1,0 +1,25 @@
+[package]
+name = "herdr-git-panel"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Branch-aware Git sidebar for Herdr"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+fs2 = "0.4"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+toml_edit = "0.22"
+tui-textarea = "0.7"
+unicode-width = "0.2"
+url = "2"
+wait-timeout = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true

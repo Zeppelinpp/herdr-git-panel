@@ -1,0 +1,29 @@
+id = "kingdee.git-panel"
+name = "Git Panel"
+version = "0.4.0"
+min_herdr_version = "0.9.5"
+description = "Rust Git sidebar with searchable branches, commit graph and MR workflow"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle Git panel"
+contexts = ["pane", "workspace"]
+command = ["bin/herdr-git-panel", "toggle"]
+
+[[panes]]
+id = "panel"
+title = "Git"
+placement = "split"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/herdr-git-panel" panel']
+
+[[panes]]
+id = "diff"
+title = "Git diff"
+placement = "popup"
+width = "90%"
+height = "88%"
+command = ["sh", "-c", 'exec "$HERDR_PLUGIN_ROOT/bin/herdr-git-panel" diff']
