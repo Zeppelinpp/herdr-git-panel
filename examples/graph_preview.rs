@@ -101,7 +101,7 @@ fn main() -> Result<()> {
         summary: &summary,
         files: &files,
     });
-    let rows = graph::project(&commits, expanded, 78);
+    let rows = graph::project(&commits, &expanded.into_iter().collect::<Vec<_>>(), 78);
     let height = (rows.len() + 3) as u16;
     let mut terminal = Terminal::new(TestBackend::new(78, height))?;
     let mut state = TableState::default().with_selected(

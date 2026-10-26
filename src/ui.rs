@@ -22,6 +22,7 @@ use ratatui::{
     DefaultTerminal, Frame, Terminal,
 };
 use std::{
+    collections::HashMap,
     env, io,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender},
@@ -166,7 +167,7 @@ pub struct Panel {
     file_cache: FileCache,
     working_files: ListState,
     branch_files: ListState,
-    details: Option<Details>,
+    details: HashMap<String, Details>,
     limit: usize,
     hits: Vec<(Rect, Hit)>,
     sender: Sender<Result<Update>>,
@@ -294,7 +295,7 @@ impl Panel {
             file_cache: FileCache::default(),
             working_files: ListState::default().with_selected(Some(0)),
             branch_files: ListState::default().with_selected(Some(0)),
-            details: None,
+            details: HashMap::new(),
             limit,
             hits: Vec::new(),
             sender,
@@ -351,7 +352,7 @@ impl Panel {
             Ok(Update::Snapshot(snapshot)) => {
                 self.snapshot = Some(*snapshot);
                 self.message = self.refresh_notice.take().unwrap_or_default();
-                self.details = None;
+                self.details.clear();
                 self.graph_cache.invalidate();
                 self.file_cache.valid = false;
                 self.working_files = ListState::default().with_selected(Some(0));
@@ -362,11 +363,14 @@ impl Panel {
                     .snapshot
                     .as_ref()
                     .and_then(|s| s.graph.iter().position(|r| r.sha == sha));
-                self.details = Some(Details {
-                    sha,
-                    summary,
-                    files,
-                });
+                self.details.insert(
+                    sha.clone(),
+                    Details {
+                        sha,
+                        summary,
+                        files,
+                    },
+                );
                 self.graph_cache.invalidate();
                 if let Some(raw_index) = raw_index {
                     self.ensure_graph(self.graph_cache.width);
@@ -504,8 +508,8 @@ impl Panel {
             .get(self.graph.selected().unwrap_or(0))
             .copied();
         let raw_index = match item {
-            Some(GraphItem::File(index)) => {
-                self.open_file(true, index);
+            Some(GraphItem::File(commit, index)) => {
+                self.open_file(Some(commit), index);
                 return;
             }
             Some(GraphItem::Commit(index)) => index,
@@ -519,9 +523,10 @@ impl Panel {
         let Some(row) = row.filter(|r| !r.sha.is_empty()) else {
             return;
         };
-        if self.details.as_ref().is_some_and(|d| d.sha == row.sha) {
-            self.details = None;
+        if self.details.remove(&row.sha).is_some() {
             self.graph_cache.invalidate();
+            self.ensure_graph(self.graph_cache.width);
+            self.graph.select(self.graph_cache.commits[raw_index]);
             return;
         }
         let repo = self.repo.clone();
@@ -530,13 +535,17 @@ impl Panel {
             Ok(Update::Details(row.sha, summary, files))
         });
     }
-    fn open_file(&mut self, commit: bool, index: usize) {
-        let data = if commit {
-            self.details.as_ref().and_then(|d| {
-                d.files
-                    .get(index)
-                    .map(|f| (String::new(), d.sha.clone(), f.path.clone()))
-            })
+    fn open_file(&mut self, commit: Option<usize>, index: usize) {
+        let data = if let Some(commit) = commit {
+            self.snapshot
+                .as_ref()
+                .and_then(|s| s.graph.get(commit))
+                .and_then(|row| self.details.get(&row.sha))
+                .and_then(|d| {
+                    d.files
+                        .get(index)
+                        .map(|f| (String::new(), d.sha.clone(), f.path.clone()))
+                })
         } else {
             self.snapshot.as_ref().and_then(|s| {
                 s.files
@@ -637,7 +646,7 @@ impl Panel {
             }
             Focus::Graph => self.select_graph(),
             Focus::HistoryToggle => self.toggle_history(),
-            Focus::BranchFiles => self.open_file(false, self.branch_files.selected().unwrap_or(0)),
+            Focus::BranchFiles => self.open_file(None, self.branch_files.selected().unwrap_or(0)),
             Focus::WorkingFiles => {
                 self.open_working_file(self.working_files.selected().unwrap_or(0))
             }
@@ -936,7 +945,7 @@ impl Panel {
                         }
                         Focus::BranchFiles => {
                             self.branch_files.select(Some(index));
-                            self.open_file(false, index);
+                            self.open_file(None, index);
                         }
                         _ => (),
                     }
@@ -1175,11 +1184,15 @@ impl Panel {
             .map(|s| {
                 graph::project(
                     &s.graph,
-                    self.details.as_ref().map(|d| graph::Expanded {
-                        sha: &d.sha,
-                        summary: &d.summary,
-                        files: &d.files,
-                    }),
+                    &self
+                        .details
+                        .values()
+                        .map(|d| graph::Expanded {
+                            sha: &d.sha,
+                            summary: &d.summary,
+                            files: &d.files,
+                        })
+                        .collect::<Vec<_>>(),
                     width,
                 )
             })
@@ -1922,7 +1935,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 panel.graph_cache.items[panel.graph.selected().unwrap()],
-                GraphItem::File(0)
+                GraphItem::File(0, 0)
             );
             panel
                 .handle_event(Event::Key(KeyEvent::new(
@@ -1942,7 +1955,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 panel.graph_cache.items[panel.graph.selected().unwrap()],
-                GraphItem::File(0)
+                GraphItem::File(0, 0)
             );
         }
     }
@@ -2359,15 +2372,18 @@ mod tests {
                 .unwrap()
                 .find('○')
                 .unwrap();
-            panel.details = Some(Details {
-                sha: "abc12345".into(),
-                summary: "1 file changed".into(),
-                files: vec![FileStat {
-                    path: "feature.rs".into(),
-                    added: "1".into(),
-                    deleted: "0".into(),
-                }],
-            });
+            panel.details.insert(
+                "abc12345".into(),
+                Details {
+                    sha: "abc12345".into(),
+                    summary: "1 file changed".into(),
+                    files: vec![FileStat {
+                        path: "feature.rs".into(),
+                        added: "1".into(),
+                        deleted: "0".into(),
+                    }],
+                },
+            );
             panel.graph_cache.invalidate();
             terminal.draw(|f| panel.render(f)).unwrap();
             let after = dump(&terminal);
@@ -2449,22 +2465,25 @@ mod tests {
         assert!(matches!(panel.dialog,Some(Dialog::Push(ref r,ref t)) if r=="origin"&&t=="main"));
     }
     #[test]
-    fn inline_files_are_navigable_and_switching_details_preserves_commit_identity() {
+    fn multiple_commits_expand_independently_and_keep_file_navigation_identity() {
         let mut panel = fixture();
         panel.focus = Focus::Graph;
-        panel.details = Some(Details {
-            sha: "abc12345".into(),
-            summary: "1 file changed".into(),
-            files: vec![FileStat {
-                path: "merge.rs".into(),
-                added: "2".into(),
-                deleted: "0".into(),
-            }],
-        });
+        panel.details.insert(
+            "abc12345".into(),
+            Details {
+                sha: "abc12345".into(),
+                summary: "1 file changed".into(),
+                files: vec![FileStat {
+                    path: "merge.rs".into(),
+                    added: "2".into(),
+                    deleted: "0".into(),
+                }],
+            },
+        );
         panel.navigate(1);
         assert_eq!(
             panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::File(0)
+            GraphItem::File(0, 0)
         );
         panel.navigate(1);
         assert_eq!(
@@ -2488,8 +2507,67 @@ mod tests {
             panel.graph_cache.items[panel.graph.selected().unwrap()],
             GraphItem::Commit(2)
         );
+        assert!(
+            panel
+                .graph_cache
+                .items
+                .iter()
+                .filter(|item| matches!(item, GraphItem::File(_, _)))
+                .count()
+                == 2,
+            "opening another commit must retain the first commit's files"
+        );
+        let projections = graph::projection_count();
+        panel.navigate(1);
+        assert_eq!(
+            panel.graph_cache.items[panel.graph.selected().unwrap()],
+            GraphItem::File(2, 0)
+        );
+        panel.navigate(-1);
+        panel.navigate(-1);
+        assert_eq!(
+            panel.graph_cache.items[panel.graph.selected().unwrap()],
+            GraphItem::File(0, 0)
+        );
+        panel.navigate(1);
+        assert_eq!(
+            graph::projection_count(),
+            projections,
+            "j/k must reuse the multi-expansion cache"
+        );
+        panel.toggle_history();
+        panel.toggle_history();
+        assert_eq!(
+            panel.details.len(),
+            2,
+            "folding history preserves expanded commits"
+        );
         panel.select_graph();
-        assert!(panel.details.is_none());
+        panel.ensure_graph(80);
+        assert_eq!(
+            panel.graph_cache.items[panel.graph.selected().unwrap()],
+            GraphItem::Commit(2)
+        );
+        assert!(panel.details.contains_key("abc12345"));
+        assert!(!panel.details.contains_key("def12345"));
+        assert_eq!(
+            panel
+                .graph_cache
+                .items
+                .iter()
+                .filter(|item| matches!(item, GraphItem::File(_, _)))
+                .count(),
+            1,
+            "collapsing one commit must retain the other's files"
+        );
+        panel.navigate(-1);
+        panel.navigate(-1);
+        panel.select_graph();
+        assert_eq!(
+            panel.graph_cache.items[panel.graph.selected().unwrap()],
+            GraphItem::Commit(0)
+        );
+        assert!(panel.details.is_empty());
     }
     #[test]
     fn commit_section_can_collapse_and_reopen() {

@@ -17,13 +17,13 @@ pub(crate) fn projection_count() -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Item {
     Commit(usize),
-    File(usize),
+    File(usize, usize),
     Connector,
     Detail,
 }
 impl Item {
     pub fn selectable(self) -> bool {
-        matches!(self, Self::Commit(_) | Self::File(_))
+        matches!(self, Self::Commit(_) | Self::File(_, _))
     }
 }
 pub struct DisplayRow {
@@ -162,9 +162,13 @@ fn detail_line(row: &GraphRow, text: &str, width: usize) -> Line<'static> {
     ));
     Line::from(spans)
 }
-pub fn project(rows: &[GraphRow], expanded: Option<Expanded<'_>>, width: usize) -> Vec<DisplayRow> {
+pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Vec<DisplayRow> {
     #[cfg(test)]
     PROJECTIONS.with(|n| n.set(n.get() + 1));
+    let expanded = expanded
+        .iter()
+        .map(|d| (d.sha, d))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut output = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if row.sha.is_empty() {
@@ -174,7 +178,7 @@ pub fn project(rows: &[GraphRow], expanded: Option<Expanded<'_>>, width: usize) 
             });
             continue;
         }
-        let detail = expanded.as_ref().filter(|d| d.sha == row.sha);
+        let detail = expanded.get(row.sha.as_str());
         output.push(DisplayRow {
             item: Item::Commit(index),
             line: commit_line(row, detail.is_some(), width),
@@ -225,7 +229,7 @@ pub fn project(rows: &[GraphRow], expanded: Option<Expanded<'_>>, width: usize) 
                     ));
                 }
                 output.push(DisplayRow {
-                    item: Item::File(file_index),
+                    item: Item::File(index, file_index),
                     line: Line::from(spans),
                 });
             }
@@ -289,15 +293,15 @@ mod tests {
         }];
         let rows = project(
             &[row],
-            Some(Expanded {
+            &[Expanded {
                 sha: "123",
                 summary: "1 file changed",
                 files: &files,
-            }),
+            }],
             60,
         );
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2].item, Item::File(0));
+        assert_eq!(rows[2].item, Item::File(0, 0));
         assert!(rows[0].line.to_string().contains('▾'));
         assert!(rows[1].line.to_string().starts_with("│ │"));
         assert_eq!(rows[2].line.spans[2].style.fg, Some(Color::Yellow));
@@ -310,14 +314,14 @@ mod tests {
             lanes: "|/  ".into(),
             ..Default::default()
         };
-        let original = project(&[row.clone(), next.clone()], None, 60);
+        let original = project(&[row.clone(), next.clone()], &[], 60);
         let expanded = project(
             &[row, next],
-            Some(Expanded {
+            &[Expanded {
                 sha: "123",
                 summary: "empty",
                 files: &[],
-            }),
+            }],
             60,
         );
         assert_eq!(original.last().unwrap().line, expanded.last().unwrap().line);
@@ -338,7 +342,7 @@ mod tests {
             sha: "b".into(),
             ..Default::default()
         };
-        let rows = project(&[first, second], None, 42);
+        let rows = project(&[first, second], &[], 42);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].item, Item::Connector);
         assert_eq!(rows[1].line.to_string(), "│ ");
