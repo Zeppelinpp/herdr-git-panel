@@ -2214,7 +2214,7 @@ mod tests {
         panel.worker = Some(thread::spawn(|| {}));
         panel.refresh();
         assert!(panel.pending_refresh);
-        assert_eq!(panel.worker.take().unwrap().join().unwrap(), ());
+        panel.worker.take().unwrap().join().unwrap();
         // Completion starts the queued refresh rather than silently discarding it.
         panel.sender.send(Ok(Update::Done)).unwrap();
         panel.receive();
