@@ -19,6 +19,7 @@ pub const PLUGIN: &str = "kingdee.git-panel";
 pub struct Config {
     pub push_key: String,
     pub history_limit: usize,
+    pub auto_refresh: bool,
     pub default_remote: String,
     pub hosts: HashMap<String, String>,
 }
@@ -27,6 +28,7 @@ impl Default for Config {
         Self {
             push_key: "ctrl+p".into(),
             history_limit: 150,
+            auto_refresh: true,
             default_remote: "origin".into(),
             hosts: HashMap::new(),
         }

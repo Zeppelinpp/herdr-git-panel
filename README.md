@@ -1,58 +1,53 @@
 # Herdr Git Panel
 
-A **Rust** Git sidebar for Herdr, built with Ratatui and Crossterm. Search local and previously fetched branches, commit with separate title/description, create GitHub PRs or GitLab MRs, inspect a continuous commit graph, open native diff popups, and push to the selected comparison branch.
+A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit history, diffs, commits, push, and GitHub/GitLab merge requests. The panel follows your existing Herdr theme.
 
-The interface inherits **Herdr's configured theme**: the named built-in palette, `[theme.custom]` overrides and `[ui].accent`. Backgrounds, text, borders, selection, branch labels, graph lanes and additions/deletions use those host tokens. It does not install its own theme or change terminal fonts. Selecting Herdr's `terminal` theme preserves terminal defaults instead. Reopen the panel or press Ctrl+R after changing Herdr's config. See [palette resolution](assets/README.md) for the auto-switch and remote-client limitations of the current Herdr API.
+## Features
 
-Navigation rows use a soft fill derived from the Herdr panel background and accent, making j/k selection easier to track while retaining normal text and rail colors. An explicitly configured Herdr `theme.custom.selection_bg` (including active mode overrides) takes precedence. Text selection keeps the inherited selection color; a focused input's insertion cursor uses the host accent with contrasting text, independently of the darker selection fill. Unfocused inputs do not draw a cursor block.
+- **Branch comparison:** search local and already fetched remote branches by name. The panel never fetches automatically.
+- **Working-tree changes:** browse unstaged, staged and untracked files. Open a file to inspect its diff.
+- **Committed changes:** see file statistics between the selected comparison branch and the current branch.
+- **Commit history:** browse a colored branch/merge graph. Expand multiple commits independently to inspect their file statistics and diffs. History starts collapsed to leave more room for working-tree changes.
+- **Commit:** enter a title and multiline description. Stage all changes, or commit only files already staged.
+- **Create MR / PR:** choose the remote, source branch, target branch, title and description. After creation, a clickable `!MR number ↗` link appears beside Create MR. Push the source branch before creating the request.
+- **Push:** push the current branch to the destination derived from the comparison branch. A confirmation shows the destination before pushing.
+- **Automatic refresh:** local file and Git changes update the panel while preserving your draft, selection and expanded commits.
 
-## Install from GitHub
-
-```sh
-herdr plugin install Zeppelinpp/herdr-git-panel --ref v0.4.2
-```
-
-Herdr runs the manifest build and registers the plugin. This source installation requires Git and Rust ≥1.88; add the shortcut shown below and reload Herdr config. Omit `--ref` to track the default branch instead of a fixed release. Fixed-tag installations stay pinned when updated.
-
-Prebuilt archives are available from [GitHub Releases](https://github.com/Zeppelinpp/herdr-git-panel/releases/latest), together with `SHA256SUMS`. They include the executable and plugin manifest and do not require Rust:
-
-| Platform | Archive target |
+| Action | Shortcut |
 | --- | --- |
-| macOS Apple Silicon | `aarch64-apple-darwin` |
-| macOS Intel | `x86_64-apple-darwin` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+| Open / close the panel | `Cmd+Shift+R` after setup |
+| Move focus | `Tab` / `Shift+Tab` |
+| Navigate files and commits | `j` / `k`, `↑` / `↓`, mouse wheel |
+| Expand a commit or open a diff | `Enter` or click |
+| Commit | `Ctrl+S` |
+| Push | `Ctrl+P`, configurable |
+| Refresh | `Ctrl+R` |
+| Open the created MR / PR | Click its link, or focus it and press `Enter` |
+| Close a diff, dialog or panel | `Esc` |
 
-Linux archives are built on Ubuntu 22.04 and require glibc ≥2.35. For other Linux environments, build from source. For example, after downloading and verifying the Apple Silicon archive:
+In a diff popup, use `↑` / `↓` to scroll, `←` / `→` to scroll horizontally, and `PageUp` / `PageDown` for larger steps.
 
-```sh
-grep '  herdr-git-panel-v0.4.2-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c -
-tar -xzf herdr-git-panel-v0.4.2-aarch64-apple-darwin.tar.gz
-cd herdr-git-panel-v0.4.2-aarch64-apple-darwin
-./bin/herdr-git-panel setup
-```
+## Installation
 
-The prebuilt setup links the extracted directory and adds the keybinding. Keep that directory in a durable location. `plugin link` does not execute manifest build commands. For GitHub-managed installations, keep the registration created by `plugin install`; the setup command is intended for local/prebuilt directories.
+Requires **Herdr ≥0.9.5**, Git, and macOS or Linux. Creating requests also requires an authenticated `gh` for GitHub or `glab` for GitLab.
 
-## Build locally
+### Install from GitHub
 
-Requires a current stable Rust toolchain (`cargo`), Git, and Herdr ≥0.9.5 on macOS or Linux. Python and uv are not required. MR creation additionally requires authenticated `gh` or `glab`.
-
-```sh
-cd ~/projects/herdr-git-panel
-sh scripts/build.sh
-./bin/herdr-git-panel setup
-```
-
-Setup links the checkout, adds **Cmd+Shift+R**, and reloads Herdr config. It preserves dotfiles symlinks and existing comments/settings, backs up the config before changes, and refuses to replace a conflicting shortcut. No Herdr restart is needed. Close an already-running panel and reopen it after rebuilding.
-
-For manual setup:
+Requires **Rust ≥1.88** and Cargo:
 
 ```sh
-herdr plugin link "$PWD"
+herdr plugin install Zeppelinpp/herdr-git-panel
 ```
 
-Add to Herdr's `config.toml`, then run `herdr server reload-config`:
+This installs the latest code from the repository's default branch. To update later:
+
+```sh
+herdr plugin update kingdee.git-panel
+```
+
+Close and reopen an existing panel after updating.
+
+Add this shortcut to `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -62,122 +57,103 @@ command = "kingdee.git-panel.toggle"
 description = "Toggle Git panel"
 ```
 
-If the outer terminal reserves Cmd+Shift+R, configure it to forward the shortcut or pick another binding. Linux users can choose a chord their terminal transmits.
+Reload the config:
 
-## Interaction
+```sh
+herdr server reload-config
+```
 
-- **Compare:** click the comparison branch or focus it with Tab and press Enter. Type any part of the branch name to filter immediately, case-insensitively. Multiple space-separated terms must all match. Use ↑/↓ and Enter or click a result. Esc cancels without changing the comparison. Only `refs/heads` and existing `refs/remotes` are listed; opening, searching and refreshing never fetch or run `ls-remote`.
-- **Commit:** edit title and multiline description. Click Commit, Tab to it and press Enter, or use Ctrl+S. “Stage all changes” defaults on and includes new, modified and deleted files; turn it off to use the current index. Hooks and signing remain active. Failed commits preserve the draft and any staging already performed.
-- **MR / PR:** click Create MR and edit remote, source, target, title and description. Tab/Shift+Tab moves between fields and Create/Cancel; Enter in the description inserts a newline. The source must already be pushed. This operation does not push. A successful result exposes a clickable `!MR number` browser link, also used for GitHub PRs. Cross-project/fork MRs are outside this form.
-- **Working tree:** lists changes that have not been committed, independently of the comparison branch. `[U]` means unstaged (`git diff`), `[S]` means staged (`git diff --cached`), and `[?]` means untracked (excluding ignored files). A file can appear twice when its index and working-tree versions both differ; each entry opens the corresponding patch. The heading totals tracked insertions/deletions across both layers, counting unique paths; untracked files show a marker rather than an invented line count. Untracked patches are read lazily on click. Deleted/binary files are included. Use Tab and j/k or the mouse wheel to navigate; Enter/click opens the native popup. Nothing is staged by viewing it.
-- **Committed on branch:** shows merge-base-to-HEAD file stats from `git diff <comparison>...HEAD`. This section covers committed changes; local edits belong in Working tree above it. Click a file or use Tab, ↑/↓, Enter to open its patch.
-- **Graph:** follows the supplied Orca reference: a `COMMITS` section, colored rails at the left, solid ordinary-commit nodes, hollow merge nodes, disclosure arrows, commit subjects and right-aligned branch badges. **History starts collapsed as a one-line bar at the bottom.** Click the heading or Tab to it and press Enter to expand it; folding it moves the bar down and releases its height to the working-tree list. The graph is not projected while folded. Opening history focuses its rows immediately, so j/k works without another Tab. Use Shift+Tab to return to the heading and Enter to fold it. Click or press Enter on a commit to expand its SHA, totals and file stats **inline beneath that commit**. Multiple commits can stay expanded at once; toggling one leaves the others open. Rails continue through inserted rows, and selected rows retain rail colors. Click a file to open its native diff popup. Navigation skips connector/summary rows. The refresh icon reloads local state. “Load older commits” is shown only while history is open and the loaded window may have more records. Chinese text and labels are ellipsized by terminal-cell width.
-- **Diff:** a native Herdr popup displays the unified patch. ↑/↓ or mouse wheel scrolls vertically; ←/→ scrolls horizontally; PageUp/PageDown and Home are supported. Esc/q closes it. Standalone mode uses an in-process dialog. Merge diffs compare against the first parent; root commits compare against the empty tree. Renames appear as deletion/addition. Binary files show Git's patch metadata.
-- **Refresh:** Ctrl+R reads local repository state. There is no background fetch or filesystem watcher.
-- **Rendering:** the panel redraws only on input, resize/focus restoration, or a worker result. Idle panels block on terminal input; the short worker-result poll never redraws on its own. Graph rows, their selectable-item mapping, and file-list widgets are cached. j/k changes selection without rebuilding rows; a new snapshot, commit expansion/collapse, or a different graph width invalidates the relevant cache.
-- **Close:** Esc closes the active dialog or panel. Active commit/push/MR work must finish before exiting. Git operations run in a worker, keeping the terminal responsive.
+If your terminal reserves `Cmd+Shift+R`, configure it to forward the shortcut or choose another key. On Linux, choose a shortcut your terminal transmits.
 
-The compact layout keeps the form above independently scrolling working-tree files, committed branch files, and the commit graph with its inline files. **Tab / Shift+Tab** visits only actionable controls: empty lists, unavailable buttons and hidden history content are skipped. Commit requires a title and changes allowed by the staging mode; Push requires a destination; Create MR requires a branch, a commit and a configured remote. Disabled buttons are dimmed. **Enter** activates; clicking a file opens the diff directly. Commit files are navigated inside the graph rather than through a duplicate focus stop.
+### Install a prebuilt release
 
-## Push
+Download the matching archive and `SHA256SUMS` from [the latest release](https://github.com/Zeppelinpp/herdr-git-panel/releases/latest). Rust is not required.
 
-Default shortcut: **Ctrl+P**, configurable below. Push deliberately uses the **selected comparison branch as the destination**, which may differ from the current checkout. A dialog displays the exact destination and requires Enter or a click on Push.
-
-| Comparison | Destination |
+| Platform | Archive target |
 | --- | --- |
-| `origin/release` | `git push origin HEAD:refs/heads/release` |
-| local `release`, upstream `upstream/stable` | `git push upstream HEAD:refs/heads/stable` |
-| local `release`, no upstream, with `origin` | `git push origin HEAD:refs/heads/release` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
 
-No force push or automatic upstream modification. Git's rejection is displayed. SSH/credential helpers must already work without a terminal prompt.
+Linux archives require glibc ≥2.35, such as Ubuntu 22.04 or newer. For other Linux environments, install from source.
 
-## Config
+Verify the archive against `SHA256SUMS`, extract it to a permanent location, then run inside the extracted directory:
 
-Find the config directory:
+```sh
+./bin/herdr-git-panel setup
+```
+
+Setup registers that directory, adds the shortcut and reloads Herdr config. Keep the directory in place. Release archives contain the latest published release; they may lag behind the default branch.
+
+### Install a local checkout
+
+```sh
+git clone https://github.com/Zeppelinpp/herdr-git-panel.git
+cd herdr-git-panel
+sh scripts/build.sh
+./bin/herdr-git-panel setup
+```
+
+For later local changes, rerun `sh scripts/build.sh`, then close and reopen the panel. No Herdr restart is needed. Locally linked installations are updated by rebuilding, rather than `herdr plugin update`.
+
+## Configuration
+
+Find the plugin's configuration directory:
 
 ```sh
 herdr plugin config-dir kingdee.git-panel
 ```
 
-Edit `config.json` and reopen the panel:
+The default file is:
+
+```text
+~/.config/herdr/plugins/config/kingdee.git-panel/config.json
+```
+
+Create or edit `config.json`, then close and reopen the panel. A complete example:
 
 ```json
 {
   "push_key": "ctrl+p",
   "history_limit": 150,
+  "auto_refresh": true,
   "default_remote": "origin",
   "hosts": {
-    "code.company.example": "gitlab",
+    "git.kingdee.com": "gitlab",
     "github.company.example": "github"
   }
 }
 ```
 
-Push shortcuts accept Ctrl/Alt/Shift/Super modifiers with a character, Enter, Space, or F key; choose one your terminal transmits. `default_remote` is the MR fallback when the comparison has no push destination. GitHub/GitLab are inferred from the selected remote hostname; use `hosts` for self-hosted forges with other names. Credentials stay with Git, gh and glab.
+| Setting | Default | Description |
+| --- | --- | --- |
+| `push_key` | `ctrl+p` | Shortcut that opens push confirmation. |
+| `history_limit` | `150` | Commits loaded initially and per “Load older commits” action. Must be greater than zero. |
+| `auto_refresh` | `true` | Automatically refresh local changes. Set to `false` to refresh manually with `Ctrl+R`. |
+| `default_remote` | `origin` | MR / PR form fallback when the comparison has no push destination. |
+| `hosts` | `{}` | Map self-hosted Git server hostnames to `gitlab` or `github`. |
 
-Config lives in `HERDR_PLUGIN_CONFIG_DIR`; transient diff handoffs and panel records live in `HERDR_PLUGIN_STATE_DIR`. Commands use argument arrays, not shell-interpolated repository data. Popup handoffs use private temporary files, deleted when consumed or if popup launch fails.
+### Self-hosted GitHub / GitLab
 
-## Develop and validate
+For a domain such as `git.kingdee.com`, set its platform explicitly in `hosts`. Use the hostname only, without `https://` or a repository path.
 
-```sh
-cargo fmt --check
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-cargo run -- panel --repo /absolute/path/to/repository
-```
+An `Unknown forge` message means the selected remote's hostname needs this mapping. Ensure the corresponding CLI is installed and authenticated against that server before retrying. Authentication stays with Git, `gh` and `glab`.
 
-Tests cover real Git repositories (initial commits, merges, special filenames, staged-only commits, pushes to a local bare remote), local-only branch search, MR CLI argument construction, config symlinks/conflicts, Unicode/multiline input, configurable shortcuts, and graph rendering with details at 42/60 columns. They do not create real hosted MRs or validate forge credentials.
+### Push destination
 
-Graph previews rendered from a temporary nested-merge fixture using the same Rust projection and the local Herdr theme:
+The comparison branch determines where the current branch is pushed:
 
-[Collapsed rows](docs/graph-preview.png) · [Expanded file stats](docs/graph-expanded.png)
+| Selected comparison | Destination |
+| --- | --- |
+| `origin/release` | `origin`, branch `release` |
+| Local `release`, tracking `upstream/stable` | `upstream`, branch `stable` |
+| Local `release`, without an upstream | `origin`, branch `release`, if `origin` exists |
 
-Regenerate the previews without network access or touching existing repositories:
+The confirmation shows the exact destination. Push does not force-update branches or change upstream settings.
 
-```sh
-cargo run --example graph_preview -- docs/graph-preview.svg
-cargo run --example graph_preview -- docs/graph-expanded.svg --expanded
-```
+### Theme and refresh
 
-```text
-Cargo.toml / Cargo.lock  Rust dependencies
-herdr-plugin.toml       Official plugin manifest
-src/git.rs             Git operations and parsed graph data
-src/graph.rs           Orca-style rows, badges and inline rail-preserving details
-src/host.rs            Herdr CLI/socket, config and setup
-src/theme.rs           Inherited Herdr palettes and custom color overrides
-src/ui.rs              Ratatui panel, searchable picker, forms and diff viewer
-src/main.rs            panel / toggle / diff / setup dispatch
-scripts/build.sh       Reproducible release build into bin/
-tests/git_workflow.rs   Git and setup integration tests
-```
+Colors follow Herdr's configured theme, including custom colors and accent. After changing the Herdr theme, press `Ctrl+R` or reopen the panel.
 
-`sh scripts/build.sh` builds a release binary into `bin/` using a temporary filename and atomic rename, allowing existing processes to finish. Neither runtime nor setup needs the source checkout's absolute build path. A GitHub repo containing this manifest can be installed with `herdr plugin install owner/repo`; add the `herdr-plugin` topic for discovery.
-
-## Releasing
-
-CI checks formatting, manifest/version consistency, tests and Clippy on Linux/macOS, plus the declared Rust 1.88 minimum. A `vX.Y.Z` tag triggers four native builds and publishes a GitHub Release only after they pass. Release archives include the manifest, binary, MIT license, release notes and palette provenance; the publish job generates `SHA256SUMS` for all archives. Action dependencies are pinned to commit SHAs.
-
-For the next release, update `Cargo.toml`, `Cargo.lock`, `herdr-plugin.toml`, the versioned install examples and `CHANGELOG.md`; run the checks, push the default branch, and wait for CI. Then create and push the matching annotated tag. Existing version tags/releases are not overwritten.
-
-```sh
-cargo run --locked --example validate_release -- v0.4.2
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
-git tag -a v0.4.2 -m "Release v0.4.2"
-git push origin v0.4.2
-```
-
-Herdr marketplace discovery is separate from GitHub Releases: its index scans the public default branch for `herdr-plugin.toml` when the repository has the `herdr-plugin` topic.
-
-Troubleshooting: `herdr plugin log list --plugin kingdee.git-panel`. If a forge CLI completed without a recognized URL, check the forge before retrying to avoid duplicate MRs.
-
-Remove with `herdr plugin unlink kingdee.git-panel`, then remove the shortcut block and reload config. Source, config and state are preserved by unlink.
-
-## References
-
-- [Herdr plugin guide](https://herdr.dev/docs/plugins/)
-- [Herdr socket API](https://herdr.dev/docs/socket-api/)
-- [Ratatui table widget](https://ratatui.rs/examples/widgets/table/)
-- [GitHub PR creation](https://cli.github.com/manual/gh_pr_create)
-- [GitLab MR creation](https://docs.gitlab.com/cli/mr/create/)
+If automatic refresh is unavailable, the panel shows a message and manual refresh remains available. Network filesystems and very large Linux directory trees may need manual refresh. The panel never fetches remote branches; fetch through your normal Git workflow first.

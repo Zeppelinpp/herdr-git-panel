@@ -275,3 +275,84 @@ fn staged_and_unstaged_versions_of_one_file_have_distinct_patches() {
         .unwrap()
         .contains("+unstaged version"));
 }
+
+#[test]
+fn watcher_queries_ignore_generated_files_but_keep_tracked_and_deleted_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let (_dir, repo) = fixture();
+    fs::write(repo.path.join(".gitignore"), "build/\n*.ignored\n").unwrap();
+    fs::create_dir(repo.path.join("build")).unwrap();
+    fs::write(repo.path.join("build/generated"), "noise").unwrap();
+    assert!(!repo
+        .has_relevant_changes(&[repo.path.join("build/generated")])
+        .unwrap());
+    assert!(!repo
+        .has_relevant_changes(&[repo.path.join("build/deleted")])
+        .unwrap());
+    assert!(repo
+        .has_relevant_changes(&[repo.path.join("new.txt")])
+        .unwrap());
+    fs::write(repo.path.join("tracked.ignored"), "tracked").unwrap();
+    git(&repo.path, &["add", "-f", "tracked.ignored"]);
+    assert!(repo
+        .has_relevant_changes(&[repo.path.join("tracked.ignored")])
+        .unwrap());
+    fs::remove_file(repo.path.join("tracked.ignored")).unwrap();
+    assert!(repo
+        .has_relevant_changes(&[repo.path.join("tracked.ignored")])
+        .unwrap());
+    let odd = OsString::from_vec(b"\xff.ignored".to_vec());
+    let odd = repo.path.join(odd);
+    // macOS rejects creating invalid UTF-8 names, but deleted paths still arrive
+    // as raw bytes and must pass through the ignore query unchanged.
+    assert!(!repo.has_relevant_changes(&[odd]).unwrap());
+    fs::write(repo.path.join("build/forced"), "tracked").unwrap();
+    git(&repo.path, &["add", "-f", "build/forced"]);
+    assert!(repo
+        .has_relevant_changes(&[repo.path.join("build/forced")])
+        .unwrap());
+    assert!(
+        repo.has_relevant_changes(&[repo.path.join("build")])
+            .unwrap(),
+        "compressed ignored directories must retain their force-tracked descendants"
+    );
+    let paths = vec![repo.path.join("build/generated"); 300];
+    assert!(!repo.has_relevant_changes(&paths).unwrap());
+    assert!(!repo.has_relevant_changes(&[]).unwrap());
+    assert!(repo
+        .has_relevant_changes(std::slice::from_ref(&repo.path))
+        .unwrap());
+}
+
+#[test]
+fn worktree_snapshot_reads_status_and_stats_without_writing_index() {
+    let (_dir, repo) = fixture();
+    let (git_dir, common_dir) = repo.watch_paths().unwrap();
+    assert_eq!(git_dir, common_dir);
+    let index = git_dir.join("index");
+    let before = fs::metadata(&index).unwrap().modified().unwrap();
+    fs::write(repo.path.join("base.txt"), "changed\n").unwrap();
+    let (status, working) = repo.worktree_snapshot().unwrap();
+    assert!(status.contains("base.txt"));
+    assert_eq!(working.files.len(), 1);
+    assert_eq!(working.files[0].stat.path, "base.txt");
+    assert_eq!(before, fs::metadata(index).unwrap().modified().unwrap());
+}
+
+#[test]
+fn watcher_paths_resolve_linked_worktree_metadata() {
+    let (_dir, repo) = fixture();
+    let other = tempfile::tempdir().unwrap();
+    let path = other.path().join("linked");
+    git(
+        &repo.path,
+        &["worktree", "add", "-b", "linked", path.to_str().unwrap()],
+    );
+    let linked = Repo::discover(&path).unwrap();
+    let (git_dir, common_dir) = linked.watch_paths().unwrap();
+    assert_ne!(git_dir, common_dir);
+    assert!(git_dir.join("HEAD").is_file());
+    assert_eq!(common_dir, repo.watch_paths().unwrap().1);
+    assert!(common_dir.join("refs/heads").is_dir());
+}

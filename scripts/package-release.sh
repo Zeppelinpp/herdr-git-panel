@@ -15,9 +15,9 @@ staging_root=$(mktemp -d "${TMPDIR:-/tmp}/herdr-git-release.XXXXXX")
 staging="$staging_root/$package"
 mkdir -p "$staging/bin" "$staging/assets" "$staging/docs" dist
 cp "$binary" "$staging/bin/herdr-git-panel"
-cp herdr-plugin.toml README.md LICENSE CHANGELOG.md "$staging/"
+cp herdr-plugin.toml README.md LICENSE CHANGELOG.md GLOSSARY.md "$staging/"
 cp assets/README.md assets/herdr-palettes.json "$staging/assets/"
-cp docs/graph-preview.png docs/graph-preview.svg docs/graph-expanded.png docs/graph-expanded.svg "$staging/docs/"
+cp -R docs/. "$staging/docs/"
 chmod 755 "$staging/bin/herdr-git-panel"
 tar -czf "dist/$package.tar.gz" -C "$staging_root" "$package"
 printf 'Packaged dist/%s.tar.gz\n' "$package"

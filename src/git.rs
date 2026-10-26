@@ -2,11 +2,12 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::Read,
+    io::{Read, Write},
+    os::unix::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use wait_timeout::ChildExt;
 
@@ -35,17 +36,17 @@ impl ChangeKind {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingFile {
     pub stat: FileStat,
     pub kind: ChangeKind,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkingTree {
     pub files: Vec<WorkingFile>,
     pub summary: String,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GraphRow {
     pub lanes: String,
     /// Git's color identity for each graph character, mapped to host theme roles.
@@ -70,7 +71,7 @@ pub struct Mr {
     pub title: String,
     pub description: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub branch: String,
     pub branches: Vec<String>,
@@ -94,14 +95,40 @@ fn command_accept(
     timeout: u64,
     codes: &[i32],
 ) -> Result<String> {
+    command_accept_input(program, args, cwd, timeout, codes, None)
+}
+fn command_accept_input(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: u64,
+    codes: &[i32],
+    input: Option<Vec<u8>>,
+) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut child = Command::new(program)
+        .process_group(0)
         .args(args)
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Read-only refreshes must not rewrite index stat data and wake the watcher.
+        // Git still takes mandatory locks for add, commit and other mutations.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GH_PROMPT_DISABLED", "1")
-        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env(
+            "GIT_LITERAL_PATHSPECS",
+            if program == "git" && args.get(1).is_some_and(|arg| arg == "check-ignore") {
+                "0"
+            } else {
+                "1"
+            },
+        )
         .env("NO_COLOR", "1")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -117,10 +144,42 @@ fn command_accept(
         let mut data = Vec::new();
         err.read_to_end(&mut data).map(|_| data)
     });
-    let status = child.wait_timeout(Duration::from_secs(timeout))?;
-    if status.is_none() {
+    let stdin = input.map(|data| {
+        let mut stdin = child.stdin.take().unwrap();
+        thread::spawn(move || stdin.write_all(&data))
+    });
+    let terminate = |child: &mut std::process::Child| {
+        // Each invocation has its own process group. Hooks and SSH helpers must
+        // not survive a timeout while holding our output pipes open.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
         let _ = child.kill();
         let _ = child.wait();
+    };
+    let status = match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            terminate(&mut child);
+            bail!("{program} timed out after {timeout}s; check operation state before retrying");
+        }
+        Err(error) => {
+            terminate(&mut child);
+            return Err(error.into());
+        }
+    };
+    // The direct child may exit before a descendant closes inherited pipes.
+    // Apply the same deadline to collection; never unconditionally join readers.
+    while !stdout.is_finished()
+        || !stderr.is_finished()
+        || stdin.as_ref().is_some_and(|writer| !writer.is_finished())
+    {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            terminate(&mut child);
+            bail!("{program} timed out after {timeout}s collecting output; check operation state before retrying");
+        }
+        thread::sleep(remaining.min(Duration::from_millis(2)));
     }
     let out = String::from_utf8_lossy(
         &stdout
@@ -134,9 +193,7 @@ fn command_accept(
             .map_err(|_| anyhow::anyhow!("Error reader stopped"))??,
     )
     .into_owned();
-    let Some(status) = status else {
-        bail!("{program} timed out after {timeout}s; check operation state before retrying");
-    };
+    let written = stdin.map(|writer| writer.join());
     if !status.code().is_some_and(|code| codes.contains(&code)) {
         bail!(
             "{}",
@@ -147,6 +204,9 @@ fn command_accept(
             }
         );
     }
+    if let Some(written) = written {
+        written.map_err(|_| anyhow::anyhow!("Input writer stopped"))??;
+    }
     Ok(out)
 }
 impl Repo {
@@ -154,7 +214,8 @@ impl Repo {
         let mut repo = Self {
             path: path.as_ref().to_path_buf(),
         };
-        repo.path = PathBuf::from(repo.git(&["rev-parse", "--show-toplevel"])?.trim());
+        repo.path =
+            PathBuf::from(repo.git(&["rev-parse", "--show-toplevel"])?.trim()).canonicalize()?;
         Ok(repo)
     }
     pub fn git(&self, args: &[&str]) -> Result<String> {
@@ -196,10 +257,25 @@ impl Repo {
     }
     fn diff_args(&self, base: &str, commit: &str) -> Result<Vec<String>> {
         if commit.is_empty() {
-            Ok(vec![
-                "diff".into(),
-                format!("{}...HEAD", self.resolve(base)?),
-            ])
+            if !self.branches()?.iter().any(|branch| branch == base) {
+                bail!("Choose a local or already fetched branch");
+            }
+            let tips = self.git(&[
+                "rev-parse",
+                "--revs-only",
+                "--end-of-options",
+                &format!("{base}^{{commit}}"),
+                "HEAD^{commit}",
+            ])?;
+            let tips: Vec<_> = tips.lines().collect();
+            if tips.len() != 2
+                || tips
+                    .iter()
+                    .any(|tip| tip.is_empty() || !tip.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                bail!("Comparison requires a valid branch and HEAD commit");
+            }
+            Ok(vec!["diff".into(), format!("{}...{}", tips[0], tips[1])])
         } else {
             if !commit.chars().all(|c| c.is_ascii_hexdigit()) {
                 bail!("Invalid commit ID");
@@ -220,10 +296,64 @@ impl Repo {
         self.git(&args.iter().map(String::as_str).collect::<Vec<_>>())
     }
     pub fn stats(&self, base: &str, commit: &str) -> Result<(String, Vec<FileStat>)> {
-        let summary = self.diff(base, commit, &["--stat", "--no-renames", "--"])?;
-        let raw = self.diff(base, commit, &["--numstat", "-z", "--no-renames", "--"])?;
+        // Resolve both tips once: summary and numstat must compare the same commits.
+        let args = self.diff_args(base, commit)?;
+        let query = |options: &[&str]| {
+            let mut argv = args.clone();
+            argv.extend(options.iter().map(|s| s.to_string()));
+            self.git(&argv.iter().map(String::as_str).collect::<Vec<_>>())
+        };
+        let summary = query(&["--stat", "--no-renames", "--"])?;
+        let raw = query(&["--numstat", "-z", "--no-renames", "--"])?;
         let files = parse_numstat(&raw)?;
         Ok((summary, files))
+    }
+    /// The inexpensive refresh path for file/index changes; no history or refs queries.
+    pub fn worktree_snapshot(&self) -> Result<(String, WorkingTree)> {
+        Ok((self.git(&["status", "--short"])?, self.working_stats()?))
+    }
+    /// Actual metadata directories, including linked worktrees and separate git dirs.
+    pub fn watch_paths(&self) -> Result<(PathBuf, PathBuf)> {
+        let absolute = |flag| -> Result<PathBuf> {
+            let path = self.git(&["rev-parse", "--path-format=absolute", flag])?;
+            Ok(PathBuf::from(path.trim_end_matches('\n')).canonicalize()?)
+        };
+        Ok((absolute("--git-dir")?, absolute("--git-common-dir")?))
+    }
+    /// Ignore build-output events without ignoring tracked files matched by ignore rules.
+    /// NUL-delimited stdin preserves non-UTF8 names and avoids argv size limits.
+    pub fn has_relevant_changes(&self, paths: &[PathBuf]) -> Result<bool> {
+        for batch in paths.chunks(256) {
+            let argv = ["--no-pager", "check-ignore", "-z", "--stdin"].map(str::to_string);
+            let mut input = Vec::new();
+            for path in batch {
+                let relative = if path.is_absolute() {
+                    match path.strip_prefix(&self.path) {
+                        Ok(path) => path,
+                        Err(_) => return Ok(true),
+                    }
+                } else {
+                    path.as_path()
+                };
+                if relative.as_os_str().is_empty() {
+                    // Some backends only report the containing directory.
+                    return Ok(true);
+                }
+                input.extend_from_slice(relative.as_os_str().as_bytes());
+                input.push(0);
+            }
+            let Ok(ignored) =
+                command_accept_input("git", &argv, &self.path, 120, &[0, 1], Some(input))
+            else {
+                // Paths inside submodules, or deleted during a save, can be
+                // rejected by check-ignore. Authoritative status is the safe fallback.
+                return Ok(true);
+            };
+            if ignored.split('\0').filter(|path| !path.is_empty()).count() < batch.len() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     pub fn working_stats(&self) -> Result<WorkingTree> {
         let mut files = Vec::new();

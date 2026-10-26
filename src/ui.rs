@@ -1,8 +1,9 @@
 use crate::{
     git::{matching_branches, ChangeKind, FileStat, Mr, Repo, Snapshot},
-    graph::{self, Item as GraphItem},
+    history::{Action as HistoryAction, History, Identity as GraphSelection, RowHit},
     host::{self, Config, DiffData},
     theme::{Theme, INPUT_CURSOR, NAVIGATION},
+    watch::{Changes, RepoWatch},
 };
 use anyhow::{bail, Result};
 use crossterm::{
@@ -18,16 +19,15 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame, Terminal,
 };
 use std::{
-    collections::HashMap,
     env, io,
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, SyncSender},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::Instant,
 };
 use tui_textarea::TextArea;
 
@@ -60,18 +60,18 @@ const FOCI: [Focus; 13] = [
     Focus::Commit,
     Focus::Push,
     Focus::Mr,
+    Focus::Link,
     Focus::WorkingFiles,
     Focus::BranchFiles,
     Focus::HistoryToggle,
     Focus::Graph,
     Focus::More,
-    Focus::Link,
 ];
 #[derive(Clone, Debug)]
 enum Hit {
     Focus(Focus),
     BranchRow(usize),
-    GraphRow(usize),
+    GraphRow(RowHit),
     FileRow(Focus, usize),
     ModalField(usize),
     Submit,
@@ -100,7 +100,12 @@ enum Dialog {
     Push(String, String),
     Diff(Viewer),
 }
+enum AutoData {
+    Snapshot(Box<Snapshot>),
+    Working(String, crate::git::WorkingTree),
+}
 enum Update {
+    Automatic(Option<AutoData>),
     Snapshot(Box<Snapshot>),
     Details(String, String, Vec<FileStat>),
     Committed(String),
@@ -109,38 +114,11 @@ enum Update {
     Mr(String),
     Diff(DiffData),
 }
-struct Details {
-    sha: String,
-    summary: String,
-    files: Vec<FileStat>,
-}
-
-struct GraphCache {
-    width: usize,
-    valid: bool,
-    table: Table<'static>,
-    items: Vec<GraphItem>,
-    selectable: Vec<usize>,
-    commits: Vec<Option<usize>>,
-    commit_count: usize,
-}
-impl Default for GraphCache {
-    fn default() -> Self {
-        Self {
-            width: 80,
-            valid: false,
-            table: Table::default(),
-            items: Vec::new(),
-            selectable: Vec::new(),
-            commits: Vec::new(),
-            commit_count: 0,
-        }
-    }
-}
-impl GraphCache {
-    fn invalidate(&mut self) {
-        self.valid = false;
-    }
+enum Activation {
+    Focus(Focus),
+    Graph(GraphSelection),
+    Working(ChangeKind, String),
+    Branch(String),
 }
 #[derive(Default)]
 struct FileCache {
@@ -153,6 +131,7 @@ pub struct Panel {
     repo: Repo,
     theme: Theme,
     cfg: Config,
+    // Snapshot.graph moves into History when a complete snapshot is ingested.
     snapshot: Option<Snapshot>,
     title: TextArea<'static>,
     description: TextArea<'static>,
@@ -161,19 +140,21 @@ pub struct Panel {
     message: String,
     last_mr: String,
     dialog: Option<Dialog>,
-    graph: TableState,
-    graph_collapsed: bool,
-    graph_cache: GraphCache,
+    history: History,
     file_cache: FileCache,
     working_files: ListState,
     branch_files: ListState,
-    details: HashMap<String, Details>,
     limit: usize,
     hits: Vec<(Rect, Hit)>,
     sender: Sender<Result<Update>>,
     receiver: Receiver<Result<Update>>,
     worker: Option<JoinHandle<()>>,
     refresh_notice: Option<String>,
+    pending_refresh: bool,
+    pending_activation: Option<Activation>,
+    background_refresh: bool,
+    wake: Option<SyncSender<()>>,
+    watch_notice: Option<String>,
     dirty: bool,
 }
 fn textarea(value: &str) -> TextArea<'static> {
@@ -289,19 +270,21 @@ impl Panel {
             message: String::new(),
             last_mr: String::new(),
             dialog: None,
-            graph: TableState::default().with_selected(0),
-            graph_collapsed: true,
-            graph_cache: GraphCache::default(),
+            history: History::default(),
             file_cache: FileCache::default(),
             working_files: ListState::default().with_selected(Some(0)),
             branch_files: ListState::default().with_selected(Some(0)),
-            details: HashMap::new(),
             limit,
             hits: Vec::new(),
             sender,
             receiver,
             worker: None,
             refresh_notice: None,
+            pending_refresh: false,
+            pending_activation: None,
+            background_refresh: false,
+            wake: None,
+            watch_notice: None,
             dirty: true,
         }
     }
@@ -314,12 +297,24 @@ impl Panel {
         }
         self.message = label.into();
         self.dirty = true;
+        self.spawn(job);
+    }
+    fn spawn(&mut self, job: impl FnOnce() -> Result<Update> + Send + 'static) {
         let sender = self.sender.clone();
+        let wake = self.wake.clone();
         self.worker = Some(thread::spawn(move || {
             let _ = sender.send(job());
+            if let Some(wake) = wake {
+                let _ = wake.try_send(());
+            }
         }));
     }
     pub fn refresh(&mut self) {
+        if self.busy() {
+            self.pending_refresh = true;
+            return;
+        }
+        self.pending_refresh = false;
         self.dirty = true;
         match Theme::load() {
             Ok(theme) => self.theme = theme,
@@ -343,40 +338,24 @@ impl Panel {
         let Ok(result) = self.receiver.try_recv() else {
             return;
         };
-        self.dirty = true;
+        self.dirty |= !matches!(&result, Ok(Update::Automatic(_)));
+        self.background_refresh = false;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
         match result {
             Err(e) => self.message = format!("{e:#}"),
             Ok(Update::Snapshot(snapshot)) => {
-                self.snapshot = Some(*snapshot);
+                self.replace_snapshot(*snapshot);
                 self.message = self.refresh_notice.take().unwrap_or_default();
-                self.details.clear();
-                self.graph_cache.invalidate();
-                self.file_cache.valid = false;
-                self.working_files = ListState::default().with_selected(Some(0));
-                self.branch_files = ListState::default().with_selected(Some(0));
             }
+            Ok(Update::Automatic(data)) => match data {
+                Some(AutoData::Snapshot(snapshot)) => self.replace_snapshot(*snapshot),
+                Some(AutoData::Working(status, working)) => self.replace_working(status, working),
+                None => (),
+            },
             Ok(Update::Details(sha, summary, files)) => {
-                let raw_index = self
-                    .snapshot
-                    .as_ref()
-                    .and_then(|s| s.graph.iter().position(|r| r.sha == sha));
-                self.details.insert(
-                    sha.clone(),
-                    Details {
-                        sha,
-                        summary,
-                        files,
-                    },
-                );
-                self.graph_cache.invalidate();
-                if let Some(raw_index) = raw_index {
-                    self.ensure_graph(self.graph_cache.width);
-                    let selected = self.graph_cache.commits.get(raw_index).copied().flatten();
-                    self.graph.select(selected);
-                }
+                self.history.expand(sha, summary, files);
                 self.message.clear();
             }
             Ok(Update::Committed(out)) => {
@@ -411,6 +390,105 @@ impl Panel {
             }
             Ok(Update::Done) => self.message.clear(),
         }
+        if !self.busy() {
+            if let Some(action) = self.pending_activation.take() {
+                if let Err(error) = self.resume_activation(action) {
+                    self.message = error.to_string();
+                }
+            }
+        }
+        if self.pending_refresh && !self.busy() {
+            self.refresh();
+        }
+    }
+    fn auto_refresh(&mut self, changes: Changes) {
+        debug_assert!(!self.busy());
+        // Recover from a failed initial read using the next filesystem event.
+        // A partial result has nowhere to apply until the first snapshot exists.
+        let changes = if self.snapshot.is_none() {
+            Changes::Repository
+        } else {
+            changes
+        };
+        let repo = self.repo.clone();
+        let base = self
+            .snapshot
+            .as_ref()
+            .map(|s| s.base.clone())
+            .unwrap_or_default();
+        let limit = self.limit;
+        self.background_refresh = true;
+        self.spawn(move || {
+            if !changes.relevant(&repo)? {
+                return Ok(Update::Automatic(None));
+            }
+            let data = match changes {
+                Changes::Repository => AutoData::Snapshot(Box::new(repo.snapshot(&base, limit)?)),
+                Changes::Worktree(_) => {
+                    let (status, working) = repo.worktree_snapshot()?;
+                    AutoData::Working(status, working)
+                }
+            };
+            Ok(Update::Automatic(Some(data)))
+        });
+    }
+    fn replace_snapshot(&mut self, mut snapshot: Snapshot) {
+        let history_changed = self.history.replace(std::mem::take(&mut snapshot.graph));
+        if self.snapshot.as_ref() == Some(&snapshot) && !history_changed {
+            return;
+        }
+        let branch_path = self
+            .snapshot
+            .as_ref()
+            .and_then(|old| old.files.get(self.branch_files.selected().unwrap_or(0)))
+            .map(|file| file.path.clone());
+        let working_key = self.working_key();
+        let working_index = self.working_files.selected().unwrap_or(0);
+        let branch_index = self.branch_files.selected().unwrap_or(0);
+        self.snapshot = Some(snapshot);
+        self.restore_working_selection(working_key, working_index);
+        let files = &self.snapshot.as_ref().unwrap().files;
+        let selected = branch_path
+            .and_then(|path| files.iter().position(|file| file.path == path))
+            .or_else(|| (!files.is_empty()).then(|| branch_index.min(files.len() - 1)));
+        self.branch_files.select(selected);
+        self.file_cache.valid = false;
+        self.dirty = true;
+    }
+    fn working_key(&self) -> Option<(ChangeKind, String)> {
+        self.snapshot
+            .as_ref()?
+            .working
+            .files
+            .get(self.working_files.selected()?)
+            .map(|file| (file.kind, file.stat.path.clone()))
+    }
+    fn restore_working_selection(&mut self, key: Option<(ChangeKind, String)>, old_index: usize) {
+        let files = &self.snapshot.as_ref().unwrap().working.files;
+        let selected = key
+            .and_then(|(kind, path)| {
+                files
+                    .iter()
+                    .position(|file| file.kind == kind && file.stat.path == path)
+            })
+            .or_else(|| (!files.is_empty()).then(|| old_index.min(files.len() - 1)));
+        self.working_files.select(selected);
+    }
+    fn replace_working(&mut self, status: String, working: crate::git::WorkingTree) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if snapshot.status == status && snapshot.working == working {
+            return;
+        }
+        let key = self.working_key();
+        let index = self.working_files.selected().unwrap_or(0);
+        let snapshot = self.snapshot.as_mut().unwrap();
+        snapshot.status = status;
+        snapshot.working = working;
+        self.restore_working_selection(key, index);
+        self.file_cache.valid = false;
+        self.dirty = true;
     }
     fn refresh_after_operation(&mut self) {
         self.refresh_notice = Some(self.message.clone());
@@ -438,17 +516,8 @@ impl Panel {
             break;
         }
     }
-    fn history_count(&self) -> usize {
-        if self.graph_cache.valid {
-            self.graph_cache.commit_count
-        } else {
-            self.snapshot
-                .as_ref()
-                .map_or(0, |s| s.graph.iter().filter(|r| !r.sha.is_empty()).count())
-        }
-    }
     fn can_focus(&self, focus: Focus) -> bool {
-        if self.busy() {
+        if self.busy() && !self.background_refresh {
             return false;
         }
         match focus {
@@ -475,87 +544,54 @@ impl Panel {
                 self.snapshot
                     .as_ref()
                     .is_some_and(|s| !s.branch.is_empty() && !s.remotes.is_empty())
-                    && self.history_count() > 0
+                    && self.history.count() > 0
             }
             Focus::WorkingFiles => self
                 .snapshot
                 .as_ref()
                 .is_some_and(|s| !s.working.files.is_empty()),
             Focus::BranchFiles => self.snapshot.as_ref().is_some_and(|s| !s.files.is_empty()),
-            Focus::HistoryToggle => self.history_count() > 0,
-            Focus::Graph => !self.graph_collapsed && self.history_count() > 0,
-            Focus::More => !self.graph_collapsed && self.history_count() >= self.limit,
+            Focus::HistoryToggle => self.history.count() > 0,
+            Focus::Graph => !self.history.folded() && self.history.count() > 0,
+            Focus::More => !self.history.folded() && self.history.count() >= self.limit,
             Focus::Link => !self.last_mr.is_empty(),
         }
     }
     fn toggle_history(&mut self) {
-        self.graph_collapsed = !self.graph_collapsed;
-        self.focus = if self.graph_collapsed {
+        self.history.toggle();
+        self.focus = if self.history.folded() {
             Focus::HistoryToggle
         } else {
             Focus::Graph
         };
     }
     fn select_graph(&mut self) {
-        if self.graph_collapsed {
-            self.graph_collapsed = false;
-            return;
-        }
-        self.ensure_graph(self.graph_cache.width);
-        let item = self
-            .graph_cache
-            .items
-            .get(self.graph.selected().unwrap_or(0))
-            .copied();
-        let raw_index = match item {
-            Some(GraphItem::File(commit, index)) => {
-                self.open_file(Some(commit), index);
-                return;
+        match self.history.activate() {
+            Some(HistoryAction::ReadCommit(sha)) => {
+                let repo = self.repo.clone();
+                self.work("Reading commit…", move || {
+                    let (summary, files) = repo.stats("", &sha)?;
+                    Ok(Update::Details(sha, summary, files))
+                });
             }
-            Some(GraphItem::Commit(index)) => index,
-            _ => return,
-        };
-        let row = self
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.graph.get(raw_index))
-            .cloned();
-        let Some(row) = row.filter(|r| !r.sha.is_empty()) else {
-            return;
-        };
-        if self.details.remove(&row.sha).is_some() {
-            self.graph_cache.invalidate();
-            self.ensure_graph(self.graph_cache.width);
-            self.graph.select(self.graph_cache.commits[raw_index]);
-            return;
+            Some(HistoryAction::OpenFile { sha, path }) => {
+                self.open_patch(String::new(), sha, path)
+            }
+            None => (),
         }
-        let repo = self.repo.clone();
-        self.work("Reading commit…", move || {
-            let (summary, files) = repo.stats("", &row.sha)?;
-            Ok(Update::Details(row.sha, summary, files))
-        });
     }
-    fn open_file(&mut self, commit: Option<usize>, index: usize) {
-        let data = if let Some(commit) = commit {
-            self.snapshot
-                .as_ref()
-                .and_then(|s| s.graph.get(commit))
-                .and_then(|row| self.details.get(&row.sha))
-                .and_then(|d| {
-                    d.files
-                        .get(index)
-                        .map(|f| (String::new(), d.sha.clone(), f.path.clone()))
-                })
-        } else {
-            self.snapshot.as_ref().and_then(|s| {
-                s.files
-                    .get(index)
-                    .map(|f| (s.base.clone(), String::new(), f.path.clone()))
-            })
-        };
-        let Some((base, sha, path)) = data else {
-            return;
-        };
+    fn open_file(&mut self, index: usize) {
+        let data = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .files
+                .get(index)
+                .map(|file| (snapshot.base.clone(), file.path.clone()))
+        });
+        if let Some((base, path)) = data {
+            self.open_patch(base, String::new(), path);
+        }
+    }
+    fn open_patch(&mut self, base: String, sha: String, path: String) {
         let repo = self.repo.clone();
         self.work("Reading diff…", move || {
             Ok(Update::Diff(DiffData {
@@ -589,8 +625,65 @@ impl Panel {
             }))
         });
     }
+    fn capture_activation(&self) -> Option<Activation> {
+        match self.focus {
+            Focus::Graph => self.history.selection().map(Activation::Graph),
+            Focus::WorkingFiles => self
+                .working_key()
+                .map(|(kind, path)| Activation::Working(kind, path)),
+            Focus::BranchFiles => self
+                .snapshot
+                .as_ref()?
+                .files
+                .get(self.branch_files.selected()?)
+                .map(|file| Activation::Branch(file.path.clone())),
+            focus => Some(Activation::Focus(focus)),
+        }
+    }
+    fn resume_activation(&mut self, action: Activation) -> Result<()> {
+        let focus = match action {
+            Activation::Focus(focus) => focus,
+            Activation::Graph(identity) => {
+                if !self.history.select(&identity) {
+                    return Ok(());
+                }
+                Focus::Graph
+            }
+            Activation::Working(kind, path) => {
+                let Some(index) = self.snapshot.as_ref().and_then(|s| {
+                    s.working
+                        .files
+                        .iter()
+                        .position(|file| file.kind == kind && file.stat.path == path)
+                }) else {
+                    return Ok(());
+                };
+                self.working_files.select(Some(index));
+                Focus::WorkingFiles
+            }
+            Activation::Branch(path) => {
+                let Some(index) = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.files.iter().position(|file| file.path == path))
+                else {
+                    return Ok(());
+                };
+                self.branch_files.select(Some(index));
+                Focus::BranchFiles
+            }
+        };
+        if self.can_focus(focus) {
+            self.focus = focus;
+            self.activate()?;
+        }
+        Ok(())
+    }
     fn activate(&mut self) -> Result<()> {
         if self.busy() {
+            if self.background_refresh {
+                self.pending_activation = self.capture_activation();
+            }
             return Ok(());
         }
         match self.focus {
@@ -646,7 +739,7 @@ impl Panel {
             }
             Focus::Graph => self.select_graph(),
             Focus::HistoryToggle => self.toggle_history(),
-            Focus::BranchFiles => self.open_file(None, self.branch_files.selected().unwrap_or(0)),
+            Focus::BranchFiles => self.open_file(self.branch_files.selected().unwrap_or(0)),
             Focus::WorkingFiles => {
                 self.open_working_file(self.working_files.selected().unwrap_or(0))
             }
@@ -661,17 +754,7 @@ impl Panel {
     }
     fn navigate(&mut self, delta: isize) {
         match self.focus {
-            Focus::Graph => {
-                self.ensure_graph(self.graph_cache.width);
-                let indices = &self.graph_cache.selectable;
-                if !indices.is_empty() {
-                    let position = indices
-                        .binary_search(&self.graph.selected().unwrap_or(0))
-                        .unwrap_or_else(|i| i.min(indices.len() - 1));
-                    let next = position.saturating_add_signed(delta).min(indices.len() - 1);
-                    self.graph.select(Some(indices[next]));
-                }
-            }
+            Focus::Graph => self.history.navigate(delta),
             Focus::WorkingFiles => move_list(
                 &mut self.working_files,
                 self.snapshot.as_ref().map_or(0, |s| s.working.files.len()),
@@ -722,7 +805,7 @@ impl Panel {
             self.activate()?;
             return Ok(false);
         }
-        if self.busy() {
+        if self.busy() && !self.background_refresh {
             return Ok(false);
         }
         match self.focus {
@@ -913,7 +996,7 @@ impl Panel {
             if !close {
                 self.dialog = Some(dialog);
             }
-        } else if !self.busy() {
+        } else if !self.busy() || self.background_refresh {
             match hit {
                 Hit::Focus(focus) => {
                     if !self.can_focus(focus) {
@@ -933,7 +1016,7 @@ impl Panel {
                 }
                 Hit::GraphRow(index) => {
                     self.focus = Focus::Graph;
-                    self.graph.select(Some(index));
+                    self.history.select_row(index);
                     self.activate()?;
                 }
                 Hit::FileRow(focus, index) => {
@@ -941,11 +1024,11 @@ impl Panel {
                     match focus {
                         Focus::WorkingFiles => {
                             self.working_files.select(Some(index));
-                            self.open_working_file(index);
+                            self.activate()?;
                         }
                         Focus::BranchFiles => {
                             self.branch_files.select(Some(index));
-                            self.open_file(None, index);
+                            self.activate()?;
                         }
                         _ => (),
                     }
@@ -995,7 +1078,7 @@ impl Panel {
                         }
                         _ => (),
                     }
-                } else if !self.busy() {
+                } else if !self.busy() || self.background_refresh {
                     match self.focus {
                         Focus::Title => {
                             self.title.insert_str(value.replace(['\r', '\n'], " "));
@@ -1026,13 +1109,18 @@ impl Panel {
             self.theme.apply(frame.buffer_mut());
             return;
         }
+        let link = self.mr_link_label();
+        let wrap_actions = area.width
+            < 31 + link.as_ref().map_or(0, |label| {
+                unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 1
+            });
         let outer = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(if wrap_actions { 2 } else { 1 }),
             Constraint::Length(2),
             Constraint::Min(6),
             Constraint::Length(1),
@@ -1108,16 +1196,23 @@ impl Panel {
             outer[4],
         );
         self.hits.push((outer[4], Hit::Focus(Focus::Stage)));
+        let action_row = Rect::new(outer[5].x, outer[5].y, outer[5].width, 1);
         let buttons = Layout::horizontal([
             Constraint::Length(11),
             Constraint::Length(9),
-            Constraint::Min(9),
+            Constraint::Min(0),
         ])
-        .split(outer[5]);
+        .split(action_row);
+        let mr_row = if wrap_actions {
+            Rect::new(outer[5].x, outer[5].y + 1, outer[5].width, 1)
+        } else {
+            buttons[2]
+        };
+        let mr_button = Rect::new(mr_row.x, mr_row.y, mr_row.width.min(11), 1);
         for (rect, focus, title) in [
             (buttons[0], Focus::Commit, "[Commit]"),
             (buttons[1], Focus::Push, "[Push]"),
-            (buttons[2], Focus::Mr, "[Create MR]"),
+            (mr_button, Focus::Mr, "[Create MR]"),
         ] {
             let enabled = self.can_focus(focus);
             frame.render_widget(
@@ -1134,8 +1229,35 @@ impl Panel {
                 self.hits.push((rect, Hit::Focus(focus)));
             }
         }
+        if let Some(label) = link {
+            let rect = Rect::new(
+                mr_row.x + 12,
+                mr_row.y,
+                mr_row
+                    .width
+                    .saturating_sub(12)
+                    .min(unicode_width::UnicodeWidthStr::width(label.as_str()) as u16),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(label).style(
+                    if self.focus == Focus::Link {
+                        NAVIGATION
+                    } else {
+                        BOLD
+                    }
+                    .add_modifier(Modifier::UNDERLINED),
+                ),
+                rect,
+            );
+            if self.can_focus(Focus::Link) && !rect.is_empty() {
+                self.hits.push((rect, Hit::Focus(Focus::Link)));
+            }
+        }
         let info = if !self.message.is_empty() {
             visible(&self.message)
+        } else if let Some(notice) = &self.watch_notice {
+            visible(notice)
         } else {
             self.snapshot
                 .as_ref()
@@ -1174,57 +1296,6 @@ impl Panel {
         }
         self.theme.apply(frame.buffer_mut());
     }
-    fn ensure_graph(&mut self, width: usize) {
-        if self.graph_cache.valid && self.graph_cache.width == width {
-            return;
-        }
-        let projected = self
-            .snapshot
-            .as_ref()
-            .map(|s| {
-                graph::project(
-                    &s.graph,
-                    &self
-                        .details
-                        .values()
-                        .map(|d| graph::Expanded {
-                            sha: &d.sha,
-                            summary: &d.summary,
-                            files: &d.files,
-                        })
-                        .collect::<Vec<_>>(),
-                    width,
-                )
-            })
-            .unwrap_or_default();
-        let mut items = Vec::with_capacity(projected.len());
-        let mut selectable = Vec::new();
-        let mut commits = vec![None; self.snapshot.as_ref().map_or(0, |s| s.graph.len())];
-        let mut rows = Vec::with_capacity(projected.len());
-        let mut commit_count = 0;
-        for (index, row) in projected.into_iter().enumerate() {
-            if row.item.selectable() {
-                selectable.push(index);
-            }
-            if let GraphItem::Commit(raw) = row.item {
-                commits[raw] = Some(index);
-                commit_count += 1;
-            }
-            items.push(row.item);
-            rows.push(Row::new(vec![row.line]));
-        }
-        self.graph_cache = GraphCache {
-            width,
-            valid: true,
-            items,
-            selectable,
-            commits,
-            commit_count,
-            table: Table::new(rows, [Constraint::Percentage(100)])
-                .column_spacing(0)
-                .row_highlight_style(NAVIGATION),
-        };
-    }
     fn ensure_files(&mut self) {
         if self.file_cache.valid {
             return;
@@ -1259,18 +1330,15 @@ impl Panel {
         };
     }
     fn render_history(&mut self, frame: &mut Frame, area: Rect) {
-        if !self.graph_collapsed {
-            self.ensure_graph(area.width as usize);
-        }
         self.ensure_files();
         let file_count = self.snapshot.as_ref().map_or(0, |s| s.files.len());
         let working_count = self.snapshot.as_ref().map_or(0, |s| s.working.files.len());
-        let show_more = !self.graph_collapsed && self.history_count() >= self.limit;
-        let footer_height = u16::from(show_more) + u16::from(!self.last_mr.is_empty());
+        let show_more = !self.history.folded() && self.history.count() >= self.limit;
+        let footer_height = u16::from(show_more);
         let available = area.height.saturating_sub(footer_height);
         let working_min = if working_count > 0 { 2 } else { 1 };
         let branch_min = if file_count > 0 { 2 } else { 1 };
-        let (working_height, branch_height, history_height) = if self.graph_collapsed {
+        let (working_height, branch_height, history_height) = if self.history.folded() {
             let working_wanted = working_count
                 .saturating_add(1)
                 .min(available.saturating_sub(1 + branch_min) as usize)
@@ -1342,11 +1410,11 @@ impl Panel {
             &mut self.hits,
         );
         if self.snapshot.is_some() {
-            let count = self.history_count();
+            let count = self.history.count();
             let header = Rect::new(layout[2].x, layout[2].y, layout[2].width, 1);
             let label = format!(
                 "{} COMMITS {count}{}",
-                if self.graph_collapsed { "›" } else { "▾" },
+                if self.history.folded() { "›" } else { "▾" },
                 if count >= self.limit { " +" } else { "" }
             );
             frame.render_widget(
@@ -1373,30 +1441,12 @@ impl Panel {
                 layout[2].width,
                 layout[2].height.saturating_sub(1),
             );
-            if !self.graph_collapsed {
-                if self.focus == Focus::Graph {
-                    frame.render_stateful_widget(&self.graph_cache.table, body, &mut self.graph);
-                } else {
-                    let mut display = self.graph.clone();
-                    *display.selected_mut() = None;
-                    frame.render_stateful_widget(&self.graph_cache.table, body, &mut display);
-                    *self.graph.offset_mut() = display.offset();
-                }
+            if !self.history.folded() {
                 self.hits.push((body, Hit::Focus(Focus::Graph)));
-                for y in 0..body.height {
-                    let index = self.graph.offset() + y as usize;
-                    if self
-                        .graph_cache
-                        .items
-                        .get(index)
-                        .is_some_and(|item| item.selectable())
-                    {
-                        self.hits.push((
-                            Rect::new(body.x, body.y + y, body.width, 1),
-                            Hit::GraphRow(index),
-                        ));
-                    }
-                }
+                self.history
+                    .render(frame, body, self.focus == Focus::Graph, |rect, index| {
+                        self.hits.push((rect, Hit::GraphRow(index)));
+                    });
             }
         }
         if show_more {
@@ -1413,23 +1463,14 @@ impl Panel {
                 self.hits.push((more, Hit::Focus(Focus::More)));
             }
         }
-        if !self.last_mr.is_empty() {
-            let rect = Rect::new(
-                layout[3].x,
-                layout[3].y + u16::from(show_more),
-                layout[3].width,
-                1,
-            );
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "!MR {} ↗",
-                    self.last_mr.rsplit('/').next().unwrap_or("")
-                ))
-                .style(NORMAL.add_modifier(Modifier::UNDERLINED)),
-                rect,
-            );
-            self.hits.push((rect, Hit::Focus(Focus::Link)));
+    }
+    fn mr_link_label(&self) -> Option<String> {
+        if self.last_mr.is_empty() {
+            return None;
         }
+        let url = url::Url::parse(&self.last_mr).ok()?;
+        let number = url.path_segments()?.rfind(|part| !part.is_empty())?;
+        Some(format!("!MR {number} ↗"))
     }
     fn render_dialog(&mut self, frame: &mut Frame, dialog: &mut Dialog) {
         self.hits.clear();
@@ -1757,17 +1798,48 @@ fn terminal() -> Result<(DefaultTerminal, TerminalGuard)> {
 }
 pub fn run(repo: Repo, cfg: Config) -> Result<()> {
     let mut panel = Panel::new(repo, cfg);
-    panel.refresh();
     let (mut terminal, _guard) = terminal()?;
+    let events = crate::runtime::Events::start()?;
+    panel.wake = Some(events.waker());
+    let watch = if !panel.cfg.auto_refresh {
+        None
+    } else {
+        match RepoWatch::start(&panel.repo, events.waker()) {
+            Ok(watch) => Some(watch),
+            Err(error) => {
+                panel.watch_notice = Some(format!(
+                    "Auto refresh unavailable: {error:#}; Ctrl+R to refresh"
+                ));
+                None
+            }
+        }
+    };
+    panel.refresh();
     loop {
         panel.receive();
-        panel.draw_pending(&mut terminal)?;
-        // Only poll while awaiting a worker result. With no pending work,
-        // block on terminal input and do not redraw or wake on a timer.
-        if panel.busy() && !event::poll(Duration::from_millis(50))? {
-            continue;
+        if let Some(watch) = &watch {
+            if let Some(warning) = watch.warning() {
+                panel.watch_notice = Some(warning);
+                panel.dirty = true;
+            }
+            if !panel.busy() && panel.dialog.is_none() {
+                if let Some(changes) = watch.take_ready(Instant::now()) {
+                    panel.auto_refresh(changes);
+                }
+            }
         }
-        match panel.handle_event(event::read()?) {
+        panel.draw_pending(&mut terminal)?;
+        // No recurring timer: native notifications and completed workers wake
+        // the loop; a deadline exists only while a change burst is settling.
+        let timeout = if panel.busy() || panel.dialog.is_some() {
+            None
+        } else {
+            watch.as_ref().and_then(|w| w.wait(Instant::now()))
+        };
+        let Some(event) = events.next(timeout)? else {
+            continue;
+        };
+        match panel.handle_event(event) {
             Ok(true) => break,
             Err(error) => {
                 panel.message = error.to_string();
@@ -1816,6 +1888,7 @@ pub fn run_diff(data: DiffData) -> Result<()> {
 mod tests {
     use super::*;
     use crate::git::GraphRow;
+    use crate::graph;
     use ratatui::{backend::TestBackend, Terminal};
     #[test]
     fn focused_commit_inputs_have_a_visible_cursor_with_and_without_text() {
@@ -1870,7 +1943,7 @@ mod tests {
     fn opening_history_routes_jk_to_commits_and_expanded_files() {
         for mouse in [false, true] {
             let mut panel = fixture();
-            panel.graph_collapsed = true;
+            panel.history.toggle();
             panel.focus = Focus::HistoryToggle;
             let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
             panel.draw_pending(&mut terminal).unwrap();
@@ -1904,8 +1977,8 @@ mod tests {
                 )))
                 .unwrap();
             assert_eq!(
-                panel.graph_cache.items[panel.graph.selected().unwrap()],
-                GraphItem::Commit(2)
+                panel.history.selection(),
+                Some(GraphSelection::Commit("def12345".into()))
             );
             panel
                 .handle_event(Event::Key(KeyEvent::new(
@@ -1934,8 +2007,8 @@ mod tests {
                 )))
                 .unwrap();
             assert_eq!(
-                panel.graph_cache.items[panel.graph.selected().unwrap()],
-                GraphItem::File(0, 0)
+                panel.history.selection(),
+                Some(GraphSelection::File("abc12345".into(), "detail.rs".into()))
             );
             panel
                 .handle_event(Event::Key(KeyEvent::new(
@@ -1944,8 +2017,8 @@ mod tests {
                 )))
                 .unwrap();
             assert_eq!(
-                panel.graph_cache.items[panel.graph.selected().unwrap()],
-                GraphItem::Commit(2)
+                panel.history.selection(),
+                Some(GraphSelection::Commit("def12345".into()))
             );
             panel
                 .handle_event(Event::Key(KeyEvent::new(
@@ -1954,9 +2027,286 @@ mod tests {
                 )))
                 .unwrap();
             assert_eq!(
-                panel.graph_cache.items[panel.graph.selected().unwrap()],
-                GraphItem::File(0, 0)
+                panel.history.selection(),
+                Some(GraphSelection::File("abc12345".into(), "detail.rs".into()))
             );
+        }
+    }
+    #[test]
+    fn automatic_worktree_updates_preserve_editors_selection_and_graph_cache() {
+        let mut panel = fixture();
+        panel.title.insert_str("WIP title");
+        panel.description.insert_str("Keep this description");
+        panel.stage = false;
+        let file = |path: &str| crate::git::WorkingFile {
+            stat: FileStat {
+                path: path.into(),
+                added: "1".into(),
+                deleted: "0".into(),
+            },
+            kind: ChangeKind::Unstaged,
+        };
+        panel.snapshot.as_mut().unwrap().working.files = vec![file("z.rs")];
+        panel.working_files.select(Some(0));
+        panel.focus = Focus::Title;
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        panel.draw_pending(&mut terminal).unwrap();
+        let projections = graph::projection_count();
+        panel.background_refresh = true;
+        panel.worker = Some(thread::spawn(|| {}));
+        panel
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('!'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        panel
+            .sender
+            .send(Ok(Update::Automatic(Some(AutoData::Working(
+                " M z.rs".into(),
+                crate::git::WorkingTree {
+                    files: vec![file("a.rs"), file("z.rs")],
+                    summary: "2 changed paths".into(),
+                },
+            )))))
+            .unwrap();
+        panel.receive();
+        panel.draw_pending(&mut terminal).unwrap();
+        assert_eq!(text(&panel.title), "WIP title!");
+        assert_eq!(text(&panel.description), "Keep this description");
+        assert!(!panel.stage);
+        assert_eq!(panel.focus, Focus::Title);
+        assert_eq!(panel.working_files.selected(), Some(1));
+        assert_eq!(
+            graph::projection_count(),
+            projections,
+            "file changes never rebuild history"
+        );
+        panel.sender.send(Ok(Update::Automatic(None))).unwrap();
+        panel.receive();
+        assert!(
+            !panel.draw_pending(&mut terminal).unwrap(),
+            "ignored output does not redraw"
+        );
+        let snapshot = snapshot_with_history(&panel);
+        panel
+            .sender
+            .send(Ok(Update::Automatic(Some(AutoData::Snapshot(Box::new(
+                snapshot,
+            ))))))
+            .unwrap();
+        panel.receive();
+        assert!(
+            !panel.draw_pending(&mut terminal).unwrap(),
+            "identical snapshots do not redraw"
+        );
+    }
+    #[test]
+    fn repository_refresh_preserves_multiple_expansions_and_selected_file_by_identity() {
+        let mut panel = fixture();
+        panel.focus = Focus::Graph;
+        for sha in ["abc12345", "def12345"] {
+            assert!(panel.history.select(&GraphSelection::Commit(sha.into())));
+            panel
+                .sender
+                .send(Ok(Update::Details(
+                    sha.into(),
+                    "1 file changed".into(),
+                    vec![FileStat {
+                        path: format!("{sha}.rs"),
+                        added: "1".into(),
+                        deleted: "0".into(),
+                    }],
+                )))
+                .unwrap();
+            panel.receive();
+        }
+        panel.navigate(1);
+        let selected = panel.history.selection().unwrap();
+        assert_eq!(
+            selected,
+            GraphSelection::File("def12345".into(), "def12345.rs".into())
+        );
+        let mut snapshot = snapshot_with_history(&panel);
+        snapshot.graph.insert(
+            0,
+            crate::git::GraphRow {
+                lanes: "* ".into(),
+                sha: "new12345".into(),
+                subject: "New commit".into(),
+                ..Default::default()
+            },
+        );
+        panel.toggle_history();
+        let projections = graph::projection_count();
+        panel
+            .sender
+            .send(Ok(Update::Automatic(Some(AutoData::Snapshot(Box::new(
+                snapshot,
+            ))))))
+            .unwrap();
+        panel.receive();
+        assert_eq!(panel.history.selection(), Some(selected.clone()));
+        assert_eq!(
+            graph::projection_count(),
+            projections,
+            "folded history is not projected"
+        );
+        panel.toggle_history();
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        terminal.draw(|frame| panel.render(frame)).unwrap();
+        assert_eq!(panel.history.selection(), Some(selected));
+        assert_eq!(
+            panel.history.selection(),
+            Some(GraphSelection::File(
+                "def12345".into(),
+                "def12345.rs".into()
+            ))
+        );
+    }
+    #[test]
+    fn background_query_allows_jk_and_deferred_enter_keeps_clicked_commit_identity() {
+        let mut panel = fixture();
+        panel.focus = Focus::Graph;
+        panel
+            .sender
+            .send(Ok(Update::Details(
+                "abc12345".into(),
+                "no files".into(),
+                vec![],
+            )))
+            .unwrap();
+        panel.receive();
+        panel.background_refresh = true;
+        panel.worker = Some(thread::spawn(|| {}));
+        // Enter on the first commit, then navigate away before the query returns.
+        panel
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        panel
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(
+            panel.history.selection(),
+            Some(GraphSelection::Commit("def12345".into()))
+        );
+        panel.sender.send(Ok(Update::Automatic(None))).unwrap();
+        panel.receive();
+        assert!(
+            panel.history.activate() == Some(HistoryAction::ReadCommit("abc12345".into())),
+            "Enter must collapse the clicked commit, not the new selection"
+        );
+        assert!(!panel.busy());
+        assert_eq!(
+            panel.history.selection(),
+            Some(GraphSelection::Commit("abc12345".into()))
+        );
+    }
+    #[test]
+    fn manual_refresh_is_retained_when_a_worker_is_running() {
+        let mut panel = fixture();
+        panel.worker = Some(thread::spawn(|| {}));
+        panel.refresh();
+        assert!(panel.pending_refresh);
+        assert_eq!(panel.worker.take().unwrap().join().unwrap(), ());
+        // Completion starts the queued refresh rather than silently discarding it.
+        panel.sender.send(Ok(Update::Done)).unwrap();
+        panel.receive();
+        assert!(!panel.pending_refresh);
+        assert!(panel.busy());
+        panel.worker.take().unwrap().join().unwrap();
+    }
+    #[test]
+    fn automatic_file_event_recovers_when_initial_snapshot_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        std::fs::write(dir.path().join("file"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "initial"]);
+        let mut panel = Panel::new(Repo::discover(dir.path()).unwrap(), Config::default());
+        panel.auto_refresh(Changes::Worktree(vec![]));
+        panel.worker.take().unwrap().join().unwrap();
+        panel.receive();
+        assert!(
+            panel.snapshot.is_some(),
+            "a file event must recover the full initial snapshot"
+        );
+        assert_eq!(panel.history.count(), 1);
+        assert!(panel.history.folded());
+    }
+    #[test]
+    fn created_mr_link_sits_beside_button_at_wide_and_narrow_widths() {
+        for width in [26, 42, 60] {
+            for url in [
+                "https://gitlab.example/team/repo/-/merge_requests/123",
+                "https://github.com/team/repo/pull/123?tab=files",
+            ] {
+                let mut panel = fixture();
+                let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                panel.draw_pending(&mut terminal).unwrap();
+                assert!(!panel.can_focus(Focus::Link));
+                assert!(!panel
+                    .hits
+                    .iter()
+                    .any(|(_, hit)| matches!(hit, Hit::Focus(Focus::Link))));
+                panel.sender.send(Ok(Update::Mr(url.into()))).unwrap();
+                panel.receive();
+                panel.draw_pending(&mut terminal).unwrap();
+                let button = panel
+                    .hits
+                    .iter()
+                    .find(|(_, hit)| matches!(hit, Hit::Focus(Focus::Mr)))
+                    .unwrap()
+                    .0;
+                let link = panel
+                    .hits
+                    .iter()
+                    .find(|(_, hit)| matches!(hit, Hit::Focus(Focus::Link)))
+                    .unwrap()
+                    .0;
+                assert_eq!(button.y, link.y, "link must share the MR button row");
+                assert!(
+                    link.x > button.right(),
+                    "link must be to the right with a gap"
+                );
+                assert!(link.right() <= width);
+                assert!(dump(&terminal)
+                    .iter()
+                    .any(|line| line.contains("[Create MR] !MR 123 ↗")));
+                panel.focus = Focus::Mr;
+                panel.change_focus(false);
+                assert_eq!(
+                    panel.focus,
+                    Focus::Link,
+                    "Tab must reach the adjacent link next"
+                );
+                assert!(matches!(
+                    panel.capture_activation(),
+                    Some(Activation::Focus(Focus::Link))
+                ));
+                assert_eq!(panel.last_mr, url);
+            }
         }
     }
     #[test]
@@ -1967,7 +2317,7 @@ mod tests {
             },
             Config::default(),
         );
-        assert!(panel.graph_collapsed);
+        assert!(panel.history.folded());
     }
     #[test]
     fn tab_skips_empty_lists_and_unavailable_commit() {
@@ -1992,7 +2342,7 @@ mod tests {
     #[test]
     fn tab_and_shift_tab_only_cycle_actionable_controls_when_history_is_folded() {
         let mut panel = fixture();
-        panel.graph_collapsed = true;
+        panel.history.toggle();
         let snapshot = panel.snapshot.as_mut().unwrap();
         snapshot.files.clear();
         snapshot.remotes.clear();
@@ -2051,7 +2401,7 @@ mod tests {
     #[test]
     fn folded_history_defers_projection_until_opened_at_the_current_width() {
         let mut panel = fixture();
-        panel.graph_collapsed = true;
+        panel.history.toggle();
         panel.focus = Focus::HistoryToggle;
         let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
         let before = graph::projection_count();
@@ -2069,9 +2419,8 @@ mod tests {
             )))
             .unwrap();
         panel.draw_pending(&mut terminal).unwrap();
-        assert!(!panel.graph_collapsed);
+        assert!(!panel.history.folded());
         assert_eq!(graph::projection_count(), before + 1);
-        assert_eq!(panel.graph_cache.width, 42);
     }
     #[test]
     fn collapsing_history_moves_it_down_and_gives_worktree_more_rows() {
@@ -2156,7 +2505,10 @@ mod tests {
                 .unwrap();
             terminal.draw(|f| panel.render(f)).unwrap();
         }
-        assert_eq!(panel.graph.selected(), Some(0));
+        assert_eq!(
+            panel.history.selection(),
+            Some(GraphSelection::Commit("abc12345".into()))
+        );
         assert_eq!(
             graph::projection_count(),
             before,
@@ -2209,7 +2561,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
         panel.draw_pending(&mut terminal).unwrap();
         let projections = graph::projection_count();
-        let mut snapshot = panel.snapshot.clone().unwrap();
+        let mut snapshot = snapshot_with_history(&panel);
         snapshot.graph[0].subject = "Updated commit".into();
         panel
             .sender
@@ -2286,8 +2638,17 @@ mod tests {
         panel.theme = Theme::default();
         // Most fixture tests exercise the expanded graph. New-panel defaults
         // are covered separately, without changing production construction.
-        panel.graph_collapsed = false;
-        panel.snapshot = Some(Snapshot {
+        panel.history.toggle();
+        panel.replace_snapshot(fixture_snapshot());
+        panel
+    }
+    fn snapshot_with_history(panel: &Panel) -> Snapshot {
+        let mut snapshot = panel.snapshot.clone().unwrap();
+        snapshot.graph = fixture_snapshot().graph;
+        snapshot
+    }
+    fn fixture_snapshot() -> Snapshot {
+        Snapshot {
             branch: "main".into(),
             branches: vec![
                 "main".into(),
@@ -2346,8 +2707,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
-        });
-        panel
+        }
     }
     fn dump(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buffer = terminal.backend().buffer();
@@ -2372,19 +2732,15 @@ mod tests {
                 .unwrap()
                 .find('○')
                 .unwrap();
-            panel.details.insert(
+            panel.history.expand(
                 "abc12345".into(),
-                Details {
-                    sha: "abc12345".into(),
-                    summary: "1 file changed".into(),
-                    files: vec![FileStat {
-                        path: "feature.rs".into(),
-                        added: "1".into(),
-                        deleted: "0".into(),
-                    }],
-                },
+                "1 file changed".into(),
+                vec![FileStat {
+                    path: "feature.rs".into(),
+                    added: "1".into(),
+                    deleted: "0".into(),
+                }],
             );
-            panel.graph_cache.invalidate();
             terminal.draw(|f| panel.render(f)).unwrap();
             let after = dump(&terminal);
             assert_eq!(
@@ -2457,117 +2813,18 @@ mod tests {
         let mut panel = fixture();
         panel.focus = Focus::Graph;
         panel.navigate(1);
-        assert_eq!(panel.graph.selected(), Some(2));
+        assert_eq!(
+            panel.history.selection(),
+            Some(GraphSelection::Commit("def12345".into()))
+        );
         panel.navigate(-1);
-        assert_eq!(panel.graph.selected(), Some(0));
+        assert_eq!(
+            panel.history.selection(),
+            Some(GraphSelection::Commit("abc12345".into()))
+        );
         panel.focus = Focus::Push;
         panel.activate().unwrap();
         assert!(matches!(panel.dialog,Some(Dialog::Push(ref r,ref t)) if r=="origin"&&t=="main"));
-    }
-    #[test]
-    fn multiple_commits_expand_independently_and_keep_file_navigation_identity() {
-        let mut panel = fixture();
-        panel.focus = Focus::Graph;
-        panel.details.insert(
-            "abc12345".into(),
-            Details {
-                sha: "abc12345".into(),
-                summary: "1 file changed".into(),
-                files: vec![FileStat {
-                    path: "merge.rs".into(),
-                    added: "2".into(),
-                    deleted: "0".into(),
-                }],
-            },
-        );
-        panel.navigate(1);
-        assert_eq!(
-            panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::File(0, 0)
-        );
-        panel.navigate(1);
-        assert_eq!(
-            panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::Commit(2)
-        );
-        panel
-            .sender
-            .send(Ok(Update::Details(
-                "def12345".into(),
-                "1 file changed".into(),
-                vec![FileStat {
-                    path: "feature.rs".into(),
-                    added: "3".into(),
-                    deleted: "1".into(),
-                }],
-            )))
-            .unwrap();
-        panel.receive();
-        assert_eq!(
-            panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::Commit(2)
-        );
-        assert!(
-            panel
-                .graph_cache
-                .items
-                .iter()
-                .filter(|item| matches!(item, GraphItem::File(_, _)))
-                .count()
-                == 2,
-            "opening another commit must retain the first commit's files"
-        );
-        let projections = graph::projection_count();
-        panel.navigate(1);
-        assert_eq!(
-            panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::File(2, 0)
-        );
-        panel.navigate(-1);
-        panel.navigate(-1);
-        assert_eq!(
-            panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::File(0, 0)
-        );
-        panel.navigate(1);
-        assert_eq!(
-            graph::projection_count(),
-            projections,
-            "j/k must reuse the multi-expansion cache"
-        );
-        panel.toggle_history();
-        panel.toggle_history();
-        assert_eq!(
-            panel.details.len(),
-            2,
-            "folding history preserves expanded commits"
-        );
-        panel.select_graph();
-        panel.ensure_graph(80);
-        assert_eq!(
-            panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::Commit(2)
-        );
-        assert!(panel.details.contains_key("abc12345"));
-        assert!(!panel.details.contains_key("def12345"));
-        assert_eq!(
-            panel
-                .graph_cache
-                .items
-                .iter()
-                .filter(|item| matches!(item, GraphItem::File(_, _)))
-                .count(),
-            1,
-            "collapsing one commit must retain the other's files"
-        );
-        panel.navigate(-1);
-        panel.navigate(-1);
-        panel.select_graph();
-        assert_eq!(
-            panel.graph_cache.items[panel.graph.selected().unwrap()],
-            GraphItem::Commit(0)
-        );
-        assert!(panel.details.is_empty());
     }
     #[test]
     fn commit_section_can_collapse_and_reopen() {
@@ -2588,12 +2845,12 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             })
             .unwrap();
-        assert!(panel.graph_collapsed);
+        assert!(panel.history.folded());
         panel.focus = Focus::Graph;
         panel
             .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        assert!(!panel.graph_collapsed);
+        assert!(!panel.history.folded());
     }
     #[test]
     fn editors_keep_unicode_and_multiline_and_shortcuts_are_configurable() {
