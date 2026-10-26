@@ -42,7 +42,7 @@ herdr plugin install Zeppelinpp/herdr-git-panel
 This installs the latest code from the repository's default branch. To update later:
 
 ```sh
-herdr plugin update Zeppelinpp.git-panel
+herdr plugin update zeppelinpp.git-panel
 ```
 
 Close and reopen an existing panel after updating.
@@ -53,7 +53,7 @@ Add this shortcut to `~/.config/herdr/config.toml`:
 [[keys.command]]
 key = "cmd+shift+r"
 type = "plugin_action"
-command = "Zeppelinpp.git-panel.toggle"
+command = "zeppelinpp.git-panel.toggle"
 description = "Toggle Git panel"
 ```
 
@@ -102,13 +102,13 @@ For later local changes, rerun `sh scripts/build.sh`, then close and reopen the 
 Find the plugin's configuration directory:
 
 ```sh
-herdr plugin config-dir Zeppelinpp.git-panel
+herdr plugin config-dir zeppelinpp.git-panel
 ```
 
 The default file is:
 
 ```text
-~/.config/herdr/plugins/config/Zeppelinpp.git-panel/config.json
+~/.config/herdr/plugins/config/zeppelinpp.git-panel/config.json
 ```
 
 Create or edit `config.json`, then close and reopen the panel. A complete example:

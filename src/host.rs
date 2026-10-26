@@ -13,7 +13,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const PLUGIN: &str = "Zeppelinpp.git-panel";
+pub const PLUGIN: &str = "zeppelinpp.git-panel";
 
 pub fn toggle_command() -> String {
     format!("{PLUGIN}.toggle")
