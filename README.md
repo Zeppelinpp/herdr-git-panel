@@ -4,9 +4,37 @@ A **Rust** Git sidebar for Herdr, built with Ratatui and Crossterm. Search local
 
 The interface inherits **Herdr's configured theme**: the named built-in palette, `[theme.custom]` overrides and `[ui].accent`. Backgrounds, text, borders, selection, branch labels, graph lanes and additions/deletions use those host tokens. It does not install its own theme or change terminal fonts. Selecting Herdr's `terminal` theme preserves terminal defaults instead. Reopen the panel or press Ctrl+R after changing Herdr's config. See [palette resolution](assets/README.md) for the auto-switch and remote-client limitations of the current Herdr API.
 
-Navigation rows use a soft fill derived from the Herdr panel background and accent, making j/k selection easier to track while retaining normal text and rail colors. An explicitly configured Herdr `theme.custom.selection_bg` (including active mode overrides) takes precedence. Text-editor selection and cursor styling keep the inherited selection color.
+Navigation rows use a soft fill derived from the Herdr panel background and accent, making j/k selection easier to track while retaining normal text and rail colors. An explicitly configured Herdr `theme.custom.selection_bg` (including active mode overrides) takes precedence. Text selection keeps the inherited selection color; a focused input's insertion cursor uses the host accent with contrasting text, independently of the darker selection fill. Unfocused inputs do not draw a cursor block.
 
-## Build and install
+## Install from GitHub
+
+```sh
+herdr plugin install Zeppelinpp/herdr-git-panel --ref v0.4.2
+```
+
+Herdr runs the manifest build and registers the plugin. This source installation requires Git and Rust ≥1.88; add the shortcut shown below and reload Herdr config. Omit `--ref` to track the default branch instead of a fixed release. Fixed-tag installations stay pinned when updated.
+
+Prebuilt archives are available from [GitHub Releases](https://github.com/Zeppelinpp/herdr-git-panel/releases/latest), together with `SHA256SUMS`. They include the executable and plugin manifest and do not require Rust:
+
+| Platform | Archive target |
+| --- | --- |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` |
+
+Linux archives are built on Ubuntu 22.04 and require glibc ≥2.35. For other Linux environments, build from source. For example, after downloading and verifying the Apple Silicon archive:
+
+```sh
+grep '  herdr-git-panel-v0.4.2-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 -c -
+tar -xzf herdr-git-panel-v0.4.2-aarch64-apple-darwin.tar.gz
+cd herdr-git-panel-v0.4.2-aarch64-apple-darwin
+./bin/herdr-git-panel setup
+```
+
+The prebuilt setup links the extracted directory and adds the keybinding. Keep that directory in a durable location. `plugin link` does not execute manifest build commands. For GitHub-managed installations, keep the registration created by `plugin install`; the setup command is intended for local/prebuilt directories.
+
+## Build locally
 
 Requires a current stable Rust toolchain (`cargo`), Git, and Herdr ≥0.9.5 on macOS or Linux. Python and uv are not required. MR creation additionally requires authenticated `gh` or `glab`.
 
@@ -43,13 +71,13 @@ If the outer terminal reserves Cmd+Shift+R, configure it to forward the shortcut
 - **MR / PR:** click Create MR and edit remote, source, target, title and description. Tab/Shift+Tab moves between fields and Create/Cancel; Enter in the description inserts a newline. The source must already be pushed. This operation does not push. A successful result exposes a clickable `!MR number` browser link, also used for GitHub PRs. Cross-project/fork MRs are outside this form.
 - **Working tree:** lists changes that have not been committed, independently of the comparison branch. `[U]` means unstaged (`git diff`), `[S]` means staged (`git diff --cached`), and `[?]` means untracked (excluding ignored files). A file can appear twice when its index and working-tree versions both differ; each entry opens the corresponding patch. The heading totals tracked insertions/deletions across both layers, counting unique paths; untracked files show a marker rather than an invented line count. Untracked patches are read lazily on click. Deleted/binary files are included. Use Tab and j/k or the mouse wheel to navigate; Enter/click opens the native popup. Nothing is staged by viewing it.
 - **Committed on branch:** shows merge-base-to-HEAD file stats from `git diff <comparison>...HEAD`. This section covers committed changes; local edits belong in Working tree above it. Click a file or use Tab, ↑/↓, Enter to open its patch.
-- **Graph:** follows the supplied Orca reference: a `COMMITS` section, colored rails at the left, solid ordinary-commit nodes, hollow merge nodes, disclosure arrows, commit subjects and right-aligned branch badges. There are no table headings or separate hash column. Click or press Enter on a commit to expand its SHA, totals and file stats **inline beneath that commit**. Rails continue through the inserted rows, and selected rows retain rail colors. Click a file to open its native diff popup. Keyboard navigation skips connector/summary rows and can enter file rows. Click the section arrow to collapse it, or its refresh icon to reload local state. “Load older commits” increases the history window. Chinese text and labels are ellipsized by terminal-cell width.
+- **Graph:** follows the supplied Orca reference: a `COMMITS` section, colored rails at the left, solid ordinary-commit nodes, hollow merge nodes, disclosure arrows, commit subjects and right-aligned branch badges. **History starts collapsed as a one-line bar at the bottom.** Click the heading or Tab to it and press Enter to expand it; folding it moves the bar down and releases its height to the working-tree list. The graph is not projected while folded. Opening history focuses its rows immediately, so j/k works without another Tab. Use Shift+Tab to return to the heading and Enter to fold it. Click or press Enter on a commit to expand its SHA, totals and file stats **inline beneath that commit**. Rails continue through inserted rows, and selected rows retain rail colors. Click a file to open its native diff popup. Navigation skips connector/summary rows. The refresh icon reloads local state. “Load older commits” is shown only while history is open and the loaded window may have more records. Chinese text and labels are ellipsized by terminal-cell width.
 - **Diff:** a native Herdr popup displays the unified patch. ↑/↓ or mouse wheel scrolls vertically; ←/→ scrolls horizontally; PageUp/PageDown and Home are supported. Esc/q closes it. Standalone mode uses an in-process dialog. Merge diffs compare against the first parent; root commits compare against the empty tree. Renames appear as deletion/addition. Binary files show Git's patch metadata.
 - **Refresh:** Ctrl+R reads local repository state. There is no background fetch or filesystem watcher.
 - **Rendering:** the panel redraws only on input, resize/focus restoration, or a worker result. Idle panels block on terminal input; the short worker-result poll never redraws on its own. Graph rows, their selectable-item mapping, and file-list widgets are cached. j/k changes selection without rebuilding rows; a new snapshot, commit expansion/collapse, or a different graph width invalidates the relevant cache.
 - **Close:** Esc closes the active dialog or panel. Active commit/push/MR work must finish before exiting. Git operations run in a worker, keeping the terminal responsive.
 
-The compact layout keeps the form above independently scrolling working-tree files, committed branch files, and the commit graph with its inline files. **Tab / Shift+Tab** navigates controls; **Enter** activates; clicking a file opens the diff directly.
+The compact layout keeps the form above independently scrolling working-tree files, committed branch files, and the commit graph with its inline files. **Tab / Shift+Tab** visits only actionable controls: empty lists, unavailable buttons and hidden history content are skipped. Commit requires a title and changes allowed by the staging mode; Push requires a destination; Create MR requires a branch, a commit and a configured remote. Disabled buttons are dimmed. **Enter** activates; clicking a file opens the diff directly. Commit files are navigated inside the graph rather than through a duplicate focus stop.
 
 ## Push
 
@@ -125,6 +153,22 @@ tests/git_workflow.rs   Git and setup integration tests
 ```
 
 `sh scripts/build.sh` builds a release binary into `bin/` using a temporary filename and atomic rename, allowing existing processes to finish. Neither runtime nor setup needs the source checkout's absolute build path. A GitHub repo containing this manifest can be installed with `herdr plugin install owner/repo`; add the `herdr-plugin` topic for discovery.
+
+## Releasing
+
+CI checks formatting, manifest/version consistency, tests and Clippy on Linux/macOS, plus the declared Rust 1.88 minimum. A `vX.Y.Z` tag triggers four native builds and publishes a GitHub Release only after they pass. Release archives include the manifest, binary, MIT license, release notes and palette provenance; the publish job generates `SHA256SUMS` for all archives. Action dependencies are pinned to commit SHAs.
+
+For the next release, update `Cargo.toml`, `Cargo.lock`, `herdr-plugin.toml`, the versioned install examples and `CHANGELOG.md`; run the checks, push the default branch, and wait for CI. Then create and push the matching annotated tag. Existing version tags/releases are not overwritten.
+
+```sh
+cargo run --locked --example validate_release -- v0.4.2
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+git tag -a v0.4.2 -m "Release v0.4.2"
+git push origin v0.4.2
+```
+
+Herdr marketplace discovery is separate from GitHub Releases: its index scans the public default branch for `herdr-plugin.toml` when the repository has the `herdr-plugin` topic.
 
 Troubleshooting: `herdr plugin log list --plugin kingdee.git-panel`. If a forge CLI completed without a recognized URL, check the forge before retrying to avoid duplicate MRs.
 
