@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0] - 2026-10-27
+
+### Fixed
+
+- Lowercase the plugin id to `zeppelinpp.git-panel`. Herdr percent-encodes uppercase letters when it derives the plugin config directory, so `Zeppelinpp.git-panel` produced `plugins/config/%5Aeppelinpp.git-panel` while the documented path and the plugin's own fallback pointed at the unescaped directory. The lowercase id keeps the config directory, the documented path and the manual-run fallback identical.
+
+### Breaking
+
+- Existing 0.5.0 installations must relink or reinstall: the id, config directory and keybinding command change again. Move settings from `plugins/config/%5Aeppelinpp.git-panel/config.json` to `plugins/config/zeppelinpp.git-panel/config.json`, and set the binding command to `zeppelinpp.git-panel.toggle`.
+
 ## [0.5.0] - 2026-10-27
 
 ### Breaking

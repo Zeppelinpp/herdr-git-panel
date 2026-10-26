@@ -1,6 +1,6 @@
 id = "zeppelinpp.git-panel"
 name = "Git Panel"
-version = "0.5.0"
+version = "0.6.0"
 min_herdr_version = "0.9.5"
 description = "Rust Git sidebar with searchable branches, commit graph and MR workflow"
 platforms = ["macos", "linux"]
