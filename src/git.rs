@@ -74,6 +74,7 @@ pub struct Mr {
 pub struct Snapshot {
     pub branch: String,
     pub branches: Vec<String>,
+    pub remotes: Vec<String>,
     pub base: String,
     pub status: String,
     pub summary: String,
@@ -383,10 +384,13 @@ impl Repo {
             self.stats(&base, "")
                 .unwrap_or_else(|e| (e.to_string(), Vec::new()))
         };
+        let remotes = self.remotes()?;
+        let push = self.push_target_with_remotes(&base, &remotes).ok();
         Ok(Snapshot {
             branch,
             branches,
-            push: self.push_target(&base).ok(),
+            push,
+            remotes,
             base,
             status: self.git(&["status", "--short"])?,
             summary,
@@ -411,9 +415,11 @@ impl Repo {
         Ok(self.git(&["remote"])?.lines().map(str::to_string).collect())
     }
     pub fn push_target(&self, base: &str) -> Result<(String, String)> {
+        self.push_target_with_remotes(base, &self.remotes()?)
+    }
+    fn push_target_with_remotes(&self, base: &str, remotes: &[String]) -> Result<(String, String)> {
         self.resolve(base)?;
         let full = self.git(&["rev-parse", "--symbolic-full-name", base])?;
-        let remotes = self.remotes()?;
         let (remote, target) = if let Some(rest) = full.trim().strip_prefix("refs/remotes/") {
             let remote = remotes
                 .iter()

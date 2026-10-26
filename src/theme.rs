@@ -16,6 +16,13 @@ pub const NAVIGATION: Style = Style::new()
     .bg(Color::Blue)
     .add_modifier(Modifier::REVERSED);
 
+// Separate insertion cursors from selection/navigation fills. Resolve these
+// markers at the end of apply(), including palettes that use ANSI tokens.
+pub const INPUT_CURSOR: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::LightBlue)
+    .add_modifier(Modifier::REVERSED);
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub name: String,
@@ -205,6 +212,7 @@ impl Theme {
             let dim = cell.modifier.contains(Modifier::DIM);
             let selected = cell.modifier.contains(Modifier::REVERSED);
             let navigation = selected && cell.bg == Color::Blue;
+            let input_cursor = selected && cell.bg == Color::LightBlue && cell.fg == Color::Black;
             cell.fg = match cell.fg {
                 Color::Reset => {
                     if dim {
@@ -230,6 +238,42 @@ impl Theme {
             }
             if dim {
                 cell.modifier.remove(Modifier::DIM);
+            }
+            if input_cursor {
+                let fill = if self.accent != Color::Reset && self.accent != self.background {
+                    self.accent
+                } else {
+                    self.text
+                };
+                if fill == Color::Reset || fill == self.background {
+                    cell.fg = Color::Reset;
+                    cell.bg = Color::Reset;
+                    // Let the terminal invert its actual defaults when no
+                    // explicit host colors are available.
+                    cell.modifier.insert(Modifier::REVERSED);
+                } else {
+                    cell.bg = fill;
+                    cell.fg = if self.background != Color::Reset {
+                        self.background
+                    } else {
+                        match fill {
+                            Color::Rgb(r, g, b)
+                                if u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114
+                                    >= 128_000 =>
+                            {
+                                Color::Black
+                            }
+                            Color::White
+                            | Color::Gray
+                            | Color::LightYellow
+                            | Color::LightGreen
+                            | Color::LightCyan => Color::Black,
+                            _ => Color::White,
+                        }
+                    };
+                    cell.modifier.remove(Modifier::REVERSED);
+                }
+                continue;
             }
             if selected {
                 if !semantic_color {
@@ -343,6 +387,30 @@ pub fn parse_color(value: &str) -> Option<Color> {
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+    #[test]
+    fn input_cursor_supports_ansi_tokens_and_terminal_default_fallback() {
+        let theme = Theme::from_config(
+            "[theme]\nname='terminal'\n[theme.custom]\npanel_bg='green'\naccent='blue'",
+            Appearance::Dark,
+        )
+        .unwrap();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buffer[(0, 0)].set_style(INPUT_CURSOR);
+        theme.apply(&mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, Color::Blue);
+        assert_eq!(buffer[(0, 0)].fg, Color::Green);
+        assert!(!buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        let theme = Theme::from_config(
+            "[theme]\nname='terminal'\n[theme.custom]\naccent='reset'",
+            Appearance::Dark,
+        )
+        .unwrap();
+        buffer.reset();
+        buffer[(0, 0)].set_style(INPUT_CURSOR);
+        theme.apply(&mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+    }
     #[test]
     fn inherits_vesper_custom_colors_and_legacy_ui_accent() {
         let theme=Theme::from_config("[theme]\nname='vesper'\n[theme.custom]\npanel_bg='#2D2A2E'\ntext='#E3E1E4'\nsubtext0='#939293'\nsurface1='#5B595C'\ngreen='#8FBF6E'\nred='#D98E96'\n[ui]\naccent='#9A8ED9'",Appearance::Dark).unwrap();

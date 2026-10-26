@@ -2,7 +2,7 @@ use crate::{
     git::{matching_branches, ChangeKind, FileStat, Mr, Repo, Snapshot},
     graph::{self, Item as GraphItem},
     host::{self, Config, DiffData},
-    theme::{Theme, NAVIGATION},
+    theme::{Theme, INPUT_CURSOR, NAVIGATION},
 };
 use anyhow::{bail, Result};
 use crossterm::{
@@ -46,8 +46,8 @@ pub enum Focus {
     Mr,
     WorkingFiles,
     BranchFiles,
+    HistoryToggle,
     Graph,
-    CommitFiles,
     More,
     Link,
 }
@@ -61,8 +61,8 @@ const FOCI: [Focus; 13] = [
     Focus::Mr,
     Focus::WorkingFiles,
     Focus::BranchFiles,
+    Focus::HistoryToggle,
     Focus::Graph,
-    Focus::CommitFiles,
     Focus::More,
     Focus::Link,
 ];
@@ -121,7 +121,6 @@ struct GraphCache {
     items: Vec<GraphItem>,
     selectable: Vec<usize>,
     commits: Vec<Option<usize>>,
-    files: Vec<usize>,
     commit_count: usize,
 }
 impl Default for GraphCache {
@@ -133,7 +132,6 @@ impl Default for GraphCache {
             items: Vec::new(),
             selectable: Vec::new(),
             commits: Vec::new(),
-            files: Vec::new(),
             commit_count: 0,
         }
     }
@@ -168,7 +166,6 @@ pub struct Panel {
     file_cache: FileCache,
     working_files: ListState,
     branch_files: ListState,
-    commit_files: ListState,
     details: Option<Details>,
     limit: usize,
     hits: Vec<(Rect, Hit)>,
@@ -219,7 +216,7 @@ fn paint_input(frame: &mut Frame, area: Rect, input: &mut TextArea<'_>, title: &
                 NORMAL.fg(Color::DarkGray)
             }),
     );
-    input.set_cursor_style(if active { SELECTED } else { NORMAL });
+    input.set_cursor_style(if active { INPUT_CURSOR } else { NORMAL });
     frame.render_widget(&*input, area);
 }
 fn footer(frame: &mut Frame, area: Rect, text: &str) {
@@ -292,12 +289,11 @@ impl Panel {
             last_mr: String::new(),
             dialog: None,
             graph: TableState::default().with_selected(0),
-            graph_collapsed: false,
+            graph_collapsed: true,
             graph_cache: GraphCache::default(),
             file_cache: FileCache::default(),
             working_files: ListState::default().with_selected(Some(0)),
             branch_files: ListState::default().with_selected(Some(0)),
-            commit_files: ListState::default().with_selected(Some(0)),
             details: None,
             limit,
             hits: Vec::new(),
@@ -377,7 +373,6 @@ impl Panel {
                     let selected = self.graph_cache.commits.get(raw_index).copied().flatten();
                     self.graph.select(selected);
                 }
-                self.commit_files.select(Some(0));
                 self.message.clear();
             }
             Ok(Update::Committed(out)) => {
@@ -432,14 +427,70 @@ impl Panel {
                 (index + step) % FOCI.len()
             };
             let focus = FOCI[next];
-            if focus == Focus::CommitFiles && self.details.is_none()
-                || focus == Focus::Link && self.last_mr.is_empty()
-            {
+            if !self.can_focus(focus) {
                 continue;
             }
             self.focus = focus;
             break;
         }
+    }
+    fn history_count(&self) -> usize {
+        if self.graph_cache.valid {
+            self.graph_cache.commit_count
+        } else {
+            self.snapshot
+                .as_ref()
+                .map_or(0, |s| s.graph.iter().filter(|r| !r.sha.is_empty()).count())
+        }
+    }
+    fn can_focus(&self, focus: Focus) -> bool {
+        if self.busy() {
+            return false;
+        }
+        match focus {
+            Focus::Title | Focus::Description | Focus::Stage => true,
+            Focus::Base => self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| !s.branches.is_empty()),
+            Focus::Commit => {
+                !text(&self.title).trim().is_empty()
+                    && self.snapshot.as_ref().is_some_and(|s| {
+                        !s.branch.is_empty()
+                            && s.working
+                                .files
+                                .iter()
+                                .any(|f| self.stage || f.kind == ChangeKind::Staged)
+                    })
+            }
+            Focus::Push => self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| !s.branch.is_empty() && s.push.is_some()),
+            Focus::Mr => {
+                self.snapshot
+                    .as_ref()
+                    .is_some_and(|s| !s.branch.is_empty() && !s.remotes.is_empty())
+                    && self.history_count() > 0
+            }
+            Focus::WorkingFiles => self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| !s.working.files.is_empty()),
+            Focus::BranchFiles => self.snapshot.as_ref().is_some_and(|s| !s.files.is_empty()),
+            Focus::HistoryToggle => self.history_count() > 0,
+            Focus::Graph => !self.graph_collapsed && self.history_count() > 0,
+            Focus::More => !self.graph_collapsed && self.history_count() >= self.limit,
+            Focus::Link => !self.last_mr.is_empty(),
+        }
+    }
+    fn toggle_history(&mut self) {
+        self.graph_collapsed = !self.graph_collapsed;
+        self.focus = if self.graph_collapsed {
+            Focus::HistoryToggle
+        } else {
+            Focus::Graph
+        };
     }
     fn select_graph(&mut self) {
         if self.graph_collapsed {
@@ -564,10 +615,15 @@ impl Panel {
                     .snapshot
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Repository is loading"))?;
+                let fallback = if snapshot.remotes.contains(&self.cfg.default_remote) {
+                    self.cfg.default_remote.clone()
+                } else {
+                    snapshot.remotes.first().cloned().unwrap_or_default()
+                };
                 let (remote, target) = snapshot
                     .push
                     .clone()
-                    .unwrap_or((self.cfg.default_remote.clone(), snapshot.base.clone()));
+                    .unwrap_or((fallback, snapshot.base.clone()));
                 self.dialog = Some(Dialog::Mr(MrDialog {
                     fields: vec![
                         textarea(&remote),
@@ -580,11 +636,11 @@ impl Panel {
                 }));
             }
             Focus::Graph => self.select_graph(),
+            Focus::HistoryToggle => self.toggle_history(),
             Focus::BranchFiles => self.open_file(false, self.branch_files.selected().unwrap_or(0)),
             Focus::WorkingFiles => {
                 self.open_working_file(self.working_files.selected().unwrap_or(0))
             }
-            Focus::CommitFiles => self.open_file(true, self.commit_files.selected().unwrap_or(0)),
             Focus::More => {
                 self.limit += self.cfg.history_limit;
                 self.refresh();
@@ -615,11 +671,6 @@ impl Panel {
             Focus::BranchFiles => move_list(
                 &mut self.branch_files,
                 self.snapshot.as_ref().map_or(0, |s| s.files.len()),
-                delta,
-            ),
-            Focus::CommitFiles => move_list(
-                &mut self.commit_files,
-                self.details.as_ref().map_or(0, |d| d.files.len()),
                 delta,
             ),
             _ => (),
@@ -856,6 +907,9 @@ impl Panel {
         } else if !self.busy() {
             match hit {
                 Hit::Focus(focus) => {
+                    if !self.can_focus(focus) {
+                        return Ok(());
+                    }
                     self.focus = focus;
                     if !matches!(
                         focus,
@@ -864,7 +918,6 @@ impl Panel {
                             | Focus::Graph
                             | Focus::BranchFiles
                             | Focus::WorkingFiles
-                            | Focus::CommitFiles
                     ) {
                         self.activate()?;
                     }
@@ -885,15 +938,11 @@ impl Panel {
                             self.branch_files.select(Some(index));
                             self.open_file(false, index);
                         }
-                        Focus::CommitFiles => {
-                            self.commit_files.select(Some(index));
-                            self.open_file(true, index);
-                        }
                         _ => (),
                     }
                 }
                 Hit::Refresh => self.refresh(),
-                Hit::ToggleGraph => self.graph_collapsed = !self.graph_collapsed,
+                Hit::ToggleGraph if self.can_focus(Focus::HistoryToggle) => self.toggle_history(),
                 _ => (),
             }
         }
@@ -955,6 +1004,9 @@ impl Panel {
         Ok(false)
     }
     pub fn render(&mut self, frame: &mut Frame) {
+        if !self.can_focus(self.focus) {
+            self.change_focus(false);
+        }
         self.hits.clear();
         let area = frame.area();
         if area.width < 26 || area.height < 22 {
@@ -1006,14 +1058,18 @@ impl Panel {
             .map(|s| s.base.as_str())
             .unwrap_or("loading…");
         frame.render_widget(
-            Paragraph::new(format!("Compare: {base} ▾")).style(if self.focus == Focus::Base {
+            Paragraph::new(format!("Compare: {base} ▾")).style(if !self.can_focus(Focus::Base) {
+                DIM
+            } else if self.focus == Focus::Base {
                 SELECTED
             } else {
                 NORMAL
             }),
             outer[1],
         );
-        self.hits.push((outer[1], Hit::Focus(Focus::Base)));
+        if self.can_focus(Focus::Base) {
+            self.hits.push((outer[1], Hit::Focus(Focus::Base)));
+        }
         paint_input(
             frame,
             outer[2],
@@ -1054,11 +1110,20 @@ impl Panel {
             (buttons[1], Focus::Push, "[Push]"),
             (buttons[2], Focus::Mr, "[Create MR]"),
         ] {
+            let enabled = self.can_focus(focus);
             frame.render_widget(
-                Paragraph::new(title).style(if self.focus == focus { SELECTED } else { BOLD }),
+                Paragraph::new(title).style(if !enabled {
+                    DIM
+                } else if self.focus == focus {
+                    SELECTED
+                } else {
+                    BOLD
+                }),
                 rect,
             );
-            self.hits.push((rect, Hit::Focus(focus)));
+            if enabled {
+                self.hits.push((rect, Hit::Focus(focus)));
+            }
         }
         let info = if !self.message.is_empty() {
             visible(&self.message)
@@ -1122,20 +1187,15 @@ impl Panel {
         let mut items = Vec::with_capacity(projected.len());
         let mut selectable = Vec::new();
         let mut commits = vec![None; self.snapshot.as_ref().map_or(0, |s| s.graph.len())];
-        let mut files = Vec::new();
         let mut rows = Vec::with_capacity(projected.len());
         let mut commit_count = 0;
         for (index, row) in projected.into_iter().enumerate() {
             if row.item.selectable() {
                 selectable.push(index);
             }
-            match row.item {
-                GraphItem::Commit(raw) => {
-                    commits[raw] = Some(index);
-                    commit_count += 1;
-                }
-                GraphItem::File(_) => files.push(index),
-                _ => (),
+            if let GraphItem::Commit(raw) = row.item {
+                commits[raw] = Some(index);
+                commit_count += 1;
             }
             items.push(row.item);
             rows.push(Row::new(vec![row.line]));
@@ -1146,7 +1206,6 @@ impl Panel {
             items,
             selectable,
             commits,
-            files,
             commit_count,
             table: Table::new(rows, [Constraint::Percentage(100)])
                 .column_spacing(0)
@@ -1187,16 +1246,40 @@ impl Panel {
         };
     }
     fn render_history(&mut self, frame: &mut Frame, area: Rect) {
-        self.ensure_graph(area.width as usize);
+        if !self.graph_collapsed {
+            self.ensure_graph(area.width as usize);
+        }
         self.ensure_files();
         let file_count = self.snapshot.as_ref().map_or(0, |s| s.files.len());
         let working_count = self.snapshot.as_ref().map_or(0, |s| s.working.files.len());
-        let branch_height = (file_count as u16 + 1).min(4);
+        let show_more = !self.graph_collapsed && self.history_count() >= self.limit;
+        let footer_height = u16::from(show_more) + u16::from(!self.last_mr.is_empty());
+        let available = area.height.saturating_sub(footer_height);
+        let working_min = if working_count > 0 { 2 } else { 1 };
+        let branch_min = if file_count > 0 { 2 } else { 1 };
+        let (working_height, branch_height, history_height) = if self.graph_collapsed {
+            let working_wanted = working_count
+                .saturating_add(1)
+                .min(available.saturating_sub(1 + branch_min) as usize)
+                as u16;
+            let branch = available.saturating_sub(1 + working_wanted);
+            (working_wanted, branch, 1)
+        } else {
+            let branch_max = available.saturating_sub(3 + working_min);
+            let branch = (file_count.saturating_add(1).min(4) as u16)
+                .min(branch_max)
+                .max(branch_min.min(branch_max));
+            let working_max = available.saturating_sub(3 + branch);
+            let working = (working_count.saturating_add(1).min(6) as u16)
+                .min(working_max)
+                .max(working_min.min(working_max));
+            (working, branch, available.saturating_sub(working + branch))
+        };
         let layout = Layout::vertical([
-            Constraint::Length((working_count as u16 + 1).min(5)),
+            Constraint::Length(working_height),
             Constraint::Length(branch_height),
-            Constraint::Min(3),
-            Constraint::Length(if self.last_mr.is_empty() { 1 } else { 2 }),
+            Constraint::Length(history_height),
+            Constraint::Length(footer_height),
         ])
         .split(area);
         render_files(
@@ -1246,7 +1329,7 @@ impl Panel {
             &mut self.hits,
         );
         if self.snapshot.is_some() {
-            let count = self.graph_cache.commit_count;
+            let count = self.history_count();
             let header = Rect::new(layout[2].x, layout[2].y, layout[2].width, 1);
             let label = format!(
                 "{} COMMITS {count}{}",
@@ -1254,14 +1337,22 @@ impl Panel {
                 if count >= self.limit { " +" } else { "" }
             );
             frame.render_widget(
-                Paragraph::new(label).style(DIM.add_modifier(Modifier::BOLD)),
+                Paragraph::new(label).style(
+                    if self.focus == Focus::HistoryToggle && self.can_focus(Focus::HistoryToggle) {
+                        NAVIGATION
+                    } else {
+                        DIM.add_modifier(Modifier::BOLD)
+                    },
+                ),
                 header,
             );
             let refresh = Rect::new(header.right().saturating_sub(2), header.y, 2, 1);
             frame.render_widget(Paragraph::new("↻").style(DIM), refresh);
-            self.hits.push((header, Hit::Focus(Focus::Graph)));
-            self.hits
-                .push((Rect::new(header.x, header.y, 2, 1), Hit::ToggleGraph));
+            if self.can_focus(Focus::HistoryToggle) {
+                self.hits.push((header, Hit::Focus(Focus::HistoryToggle)));
+                self.hits
+                    .push((Rect::new(header.x, header.y, 2, 1), Hit::ToggleGraph));
+            }
             self.hits.push((refresh, Hit::Refresh));
             let body = Rect::new(
                 layout[2].x,
@@ -1270,16 +1361,14 @@ impl Panel {
                 layout[2].height.saturating_sub(1),
             );
             if !self.graph_collapsed {
-                if self.focus == Focus::CommitFiles {
-                    if let Some(index) = self
-                        .graph_cache
-                        .files
-                        .get(self.commit_files.selected().unwrap_or(0))
-                    {
-                        self.graph.select(Some(*index));
-                    }
+                if self.focus == Focus::Graph {
+                    frame.render_stateful_widget(&self.graph_cache.table, body, &mut self.graph);
+                } else {
+                    let mut display = self.graph.clone();
+                    *display.selected_mut() = None;
+                    frame.render_stateful_widget(&self.graph_cache.table, body, &mut display);
+                    *self.graph.offset_mut() = display.offset();
                 }
-                frame.render_stateful_widget(&self.graph_cache.table, body, &mut self.graph);
                 self.hits.push((body, Hit::Focus(Focus::Graph)));
                 for y in 0..body.height {
                     let index = self.graph.offset() + y as usize;
@@ -1297,18 +1386,27 @@ impl Panel {
                 }
             }
         }
-        let more = Rect::new(layout[3].x, layout[3].y, layout[3].width, 1);
-        frame.render_widget(
-            Paragraph::new("[Load older commits]").style(if self.focus == Focus::More {
-                SELECTED
-            } else {
-                DIM
-            }),
-            more,
-        );
-        self.hits.push((more, Hit::Focus(Focus::More)));
+        if show_more {
+            let more = Rect::new(layout[3].x, layout[3].y, layout[3].width, 1);
+            frame.render_widget(
+                Paragraph::new("[Load older commits]").style(if self.focus == Focus::More {
+                    SELECTED
+                } else {
+                    DIM
+                }),
+                more,
+            );
+            if self.can_focus(Focus::More) {
+                self.hits.push((more, Hit::Focus(Focus::More)));
+            }
+        }
         if !self.last_mr.is_empty() {
-            let rect = Rect::new(layout[3].x, layout[3].y + 1, layout[3].width, 1);
+            let rect = Rect::new(
+                layout[3].x,
+                layout[3].y + u16::from(show_more),
+                layout[3].width,
+                1,
+            );
             frame.render_widget(
                 Paragraph::new(format!(
                     "!MR {} ↗",
@@ -1530,6 +1628,12 @@ fn render_files(
         area.width,
         area.height.saturating_sub(1),
     );
+    // Backfill the enlarged viewport when a list was previously scrolled near
+    // its end; otherwise collapsing history would leave mostly blank space.
+    let max_offset = len.saturating_sub(rect.height as usize);
+    if state.offset() > max_offset {
+        *state.offset_mut() = max_offset;
+    }
     let offset = if active {
         frame.render_stateful_widget(list, rect, state);
         state.offset()
@@ -1548,7 +1652,9 @@ fn render_files(
             ));
         }
     }
-    hits.push((Rect::new(area.x, area.y, area.width, 1), Hit::Focus(focus)));
+    if len > 0 && rect.height > 0 {
+        hits.push((Rect::new(area.x, area.y, area.width, 1), Hit::Focus(focus)));
+    }
 }
 fn viewer_key(viewer: &mut Viewer, key: KeyEvent) -> bool {
     match key.code {
@@ -1699,6 +1805,328 @@ mod tests {
     use crate::git::GraphRow;
     use ratatui::{backend::TestBackend, Terminal};
     #[test]
+    fn focused_commit_inputs_have_a_visible_cursor_with_and_without_text() {
+        for focus in [Focus::Title, Focus::Description] {
+            for value in ["", "a", "中文"] {
+                let mut panel = fixture();
+                panel.theme = Theme::from_config("[theme]\nname='vesper'\n[theme.custom]\npanel_bg='#2D2A2E'\ntext='#E3E1E4'\n[ui]\naccent='#9A8ED9'", crate::theme::Appearance::Dark).unwrap();
+                panel.focus = focus;
+                let input = if focus == Focus::Title {
+                    &mut panel.title
+                } else {
+                    &mut panel.description
+                };
+                input.insert_str(value);
+                input.move_cursor(tui_textarea::CursorMove::Head);
+                let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+                terminal.draw(|f| panel.render(f)).unwrap();
+                let rect = panel
+                    .hits
+                    .iter()
+                    .find(|(_, h)| matches!(h, Hit::Focus(f) if *f == focus))
+                    .unwrap()
+                    .0;
+                let cell = &terminal.backend().buffer()[(rect.x + 1, rect.y + 1)];
+                assert_eq!(
+                    cell.bg, panel.theme.accent,
+                    "focused {focus:?} cursor must not use the dark selection fill"
+                );
+                assert_eq!(
+                    cell.fg, panel.theme.background,
+                    "text beneath the cursor must remain readable"
+                );
+                let other = if focus == Focus::Title {
+                    Focus::Description
+                } else {
+                    Focus::Title
+                };
+                let rect = panel
+                    .hits
+                    .iter()
+                    .find(|(_, h)| matches!(h, Hit::Focus(f) if *f == other))
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    terminal.backend().buffer()[(rect.x + 1, rect.y + 1)].bg,
+                    panel.theme.background
+                );
+            }
+        }
+    }
+    #[test]
+    fn opening_history_routes_jk_to_commits_and_expanded_files() {
+        for mouse in [false, true] {
+            let mut panel = fixture();
+            panel.graph_collapsed = true;
+            panel.focus = Focus::HistoryToggle;
+            let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+            panel.draw_pending(&mut terminal).unwrap();
+            let event = if mouse {
+                let rect = panel
+                    .hits
+                    .iter()
+                    .find(|(_, h)| matches!(h, Hit::ToggleGraph))
+                    .unwrap()
+                    .0;
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                })
+            } else {
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            };
+            panel.handle_event(event).unwrap();
+            panel.draw_pending(&mut terminal).unwrap();
+            assert_eq!(
+                panel.focus,
+                Focus::Graph,
+                "expanded history must accept j/k immediately"
+            );
+            panel
+                .handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert_eq!(
+                panel.graph_cache.items[panel.graph.selected().unwrap()],
+                GraphItem::Commit(2)
+            );
+            panel
+                .handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('k'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            panel
+                .sender
+                .send(Ok(Update::Details(
+                    "abc12345".into(),
+                    "1 file changed".into(),
+                    vec![FileStat {
+                        path: "detail.rs".into(),
+                        added: "1".into(),
+                        deleted: "0".into(),
+                    }],
+                )))
+                .unwrap();
+            panel.receive();
+            panel.draw_pending(&mut terminal).unwrap();
+            panel
+                .handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert_eq!(
+                panel.graph_cache.items[panel.graph.selected().unwrap()],
+                GraphItem::File(0)
+            );
+            panel
+                .handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert_eq!(
+                panel.graph_cache.items[panel.graph.selected().unwrap()],
+                GraphItem::Commit(2)
+            );
+            panel
+                .handle_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('k'),
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+            assert_eq!(
+                panel.graph_cache.items[panel.graph.selected().unwrap()],
+                GraphItem::File(0)
+            );
+        }
+    }
+    #[test]
+    fn new_panels_start_with_commit_history_collapsed() {
+        let panel = Panel::new(
+            Repo {
+                path: std::env::temp_dir(),
+            },
+            Config::default(),
+        );
+        assert!(panel.graph_collapsed);
+    }
+    #[test]
+    fn tab_skips_empty_lists_and_unavailable_commit() {
+        let mut panel = fixture();
+        panel.snapshot.as_mut().unwrap().files.clear();
+        panel.snapshot.as_mut().unwrap().push = None;
+        panel.focus = Focus::Stage;
+        panel.change_focus(false);
+        assert_ne!(
+            panel.focus,
+            Focus::Commit,
+            "an empty commit title is not actionable"
+        );
+        panel.focus = Focus::WorkingFiles;
+        panel.change_focus(false);
+        assert_ne!(
+            panel.focus,
+            Focus::BranchFiles,
+            "empty lists must not capture Tab"
+        );
+    }
+    #[test]
+    fn tab_and_shift_tab_only_cycle_actionable_controls_when_history_is_folded() {
+        let mut panel = fixture();
+        panel.graph_collapsed = true;
+        let snapshot = panel.snapshot.as_mut().unwrap();
+        snapshot.files.clear();
+        snapshot.remotes.clear();
+        snapshot.push = None;
+        panel.focus = Focus::Base;
+        for expected in [
+            Focus::Title,
+            Focus::Description,
+            Focus::Stage,
+            Focus::HistoryToggle,
+            Focus::Base,
+        ] {
+            panel.change_focus(false);
+            assert_eq!(panel.focus, expected);
+        }
+        for expected in [
+            Focus::HistoryToggle,
+            Focus::Stage,
+            Focus::Description,
+            Focus::Title,
+            Focus::Base,
+        ] {
+            panel.change_focus(true);
+            assert_eq!(panel.focus, expected);
+        }
+        panel.worker = Some(thread::spawn(|| {}));
+        panel.change_focus(false);
+        assert_eq!(panel.focus, Focus::Base);
+        panel.worker.take().unwrap().join().unwrap();
+    }
+    #[test]
+    fn commit_focus_requires_title_and_changes_in_the_selected_staging_mode() {
+        let mut panel = fixture();
+        panel.title.insert_str("A commit");
+        assert!(!panel.can_focus(Focus::Commit));
+        panel
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .working
+            .files
+            .push(crate::git::WorkingFile {
+                stat: FileStat {
+                    path: "local.rs".into(),
+                    added: "1".into(),
+                    deleted: "0".into(),
+                },
+                kind: ChangeKind::Unstaged,
+            });
+        assert!(panel.can_focus(Focus::Commit));
+        panel.stage = false;
+        assert!(!panel.can_focus(Focus::Commit));
+        panel.snapshot.as_mut().unwrap().working.files[0].kind = ChangeKind::Staged;
+        assert!(panel.can_focus(Focus::Commit));
+    }
+    #[test]
+    fn folded_history_defers_projection_until_opened_at_the_current_width() {
+        let mut panel = fixture();
+        panel.graph_collapsed = true;
+        panel.focus = Focus::HistoryToggle;
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        let before = graph::projection_count();
+        panel.draw_pending(&mut terminal).unwrap();
+        assert_eq!(graph::projection_count(), before);
+        terminal.backend_mut().resize(42, 32);
+        terminal.autoresize().unwrap();
+        panel.handle_event(Event::Resize(42, 32)).unwrap();
+        panel.draw_pending(&mut terminal).unwrap();
+        assert_eq!(graph::projection_count(), before);
+        panel
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        panel.draw_pending(&mut terminal).unwrap();
+        assert!(!panel.graph_collapsed);
+        assert_eq!(graph::projection_count(), before + 1);
+        assert_eq!(panel.graph_cache.width, 42);
+    }
+    #[test]
+    fn collapsing_history_moves_it_down_and_gives_worktree_more_rows() {
+        for (width, height) in [(42, 32), (60, 40)] {
+            let mut panel = fixture();
+            panel.snapshot.as_mut().unwrap().working = crate::git::WorkingTree {
+                summary: "Working tree · 30 paths  +30 -0".into(),
+                files: (0..30)
+                    .map(|i| crate::git::WorkingFile {
+                        stat: FileStat {
+                            path: format!("change-{i:02}.rs"),
+                            added: "1".into(),
+                            deleted: "0".into(),
+                        },
+                        kind: ChangeKind::Unstaged,
+                    })
+                    .collect(),
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            panel.focus = Focus::WorkingFiles;
+            panel.working_files.select(Some(29));
+            terminal.draw(|f| panel.render(f)).unwrap();
+            let expanded_rows = panel
+                .hits
+                .iter()
+                .filter(|(_, h)| matches!(h, Hit::FileRow(Focus::WorkingFiles, _)))
+                .count();
+            let expanded_header = panel
+                .hits
+                .iter()
+                .find(|(_, h)| matches!(h, Hit::ToggleGraph))
+                .unwrap()
+                .0;
+            panel
+                .mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: expanded_header.x,
+                    row: expanded_header.y,
+                    modifiers: KeyModifiers::NONE,
+                })
+                .unwrap();
+            terminal.draw(|f| panel.render(f)).unwrap();
+            let collapsed_rows = panel
+                .hits
+                .iter()
+                .filter(|(_, h)| matches!(h, Hit::FileRow(Focus::WorkingFiles, _)))
+                .count();
+            let collapsed_header = panel
+                .hits
+                .iter()
+                .find(|(_, h)| matches!(h, Hit::ToggleGraph))
+                .unwrap()
+                .0;
+            assert!(
+                collapsed_rows > expanded_rows,
+                "folded history must release its height"
+            );
+            assert!(
+                collapsed_header.y > expanded_header.y,
+                "collapse should move the history bar down"
+            );
+            assert!(!panel
+                .hits
+                .iter()
+                .any(|(_, h)| matches!(h, Hit::Focus(Focus::More))));
+        }
+    }
+    #[test]
     fn jk_and_repeated_draws_reuse_graph_projection() {
         let mut panel = fixture();
         panel.focus = Focus::Graph;
@@ -1843,6 +2271,9 @@ mod tests {
             Config::default(),
         );
         panel.theme = Theme::default();
+        // Most fixture tests exercise the expanded graph. New-panel defaults
+        // are covered separately, without changing production construction.
+        panel.graph_collapsed = false;
         panel.snapshot = Some(Snapshot {
             branch: "main".into(),
             branches: vec![
@@ -1850,6 +2281,7 @@ mod tests {
                 "release/local".into(),
                 "origin/release-ready".into(),
             ],
+            remotes: vec!["origin".into()],
             base: "main".into(),
             status: String::new(),
             summary: "1 file changed".into(),
