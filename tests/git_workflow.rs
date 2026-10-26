@@ -186,7 +186,11 @@ fn setup_keeps_symlink_comments_and_existing_settings() {
     assert!(link.is_symlink());
     let text = fs::read_to_string(&target).unwrap();
     assert!(text.starts_with(original.trim_end()));
-    assert_eq!(text.matches("kingdee.git-panel.toggle").count(), 1);
+    assert_eq!(
+        text.matches(&herdr_git_panel::host::toggle_command())
+            .count(),
+        1
+    );
     assert!(fs::read_dir(dir.path()).unwrap().any(|p| p
         .unwrap()
         .path()

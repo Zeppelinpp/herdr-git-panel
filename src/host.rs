@@ -13,7 +13,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const PLUGIN: &str = "kingdee.git-panel";
+pub const PLUGIN: &str = "Zeppelinpp.git-panel";
+
+pub fn toggle_command() -> String {
+    format!("{PLUGIN}.toggle")
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -272,6 +276,7 @@ pub fn install_binding(config_path: &Path) -> Result<bool> {
     };
     let original = fs::read_to_string(&path).unwrap_or_default();
     let doc = original.parse::<toml_edit::DocumentMut>()?;
+    let command = toggle_command();
     let mut present = false;
     if let Some(commands) = doc
         .get("keys")
@@ -287,7 +292,7 @@ pub fn install_binding(config_path: &Path) -> Result<bool> {
                     .as_array()
                     .is_some_and(|a| a.iter().any(|s| s.as_str() == Some("cmd+shift+r")));
             if matches {
-                if cmd.get("command").and_then(|v| v.as_str()) != Some("kingdee.git-panel.toggle") {
+                if cmd.get("command").and_then(|v| v.as_str()) != Some(command.as_str()) {
                     bail!("cmd+shift+r is already assigned in {}", path.display());
                 }
                 present = true;
@@ -304,7 +309,7 @@ pub fn install_binding(config_path: &Path) -> Result<bool> {
             path.with_extension(format!("toml.git-panel-{stamp}.bak")),
         )?;
     }
-    let updated = format!("{}\n\n[[keys.command]]\nkey = \"cmd+shift+r\"\ntype = \"plugin_action\"\ncommand = \"kingdee.git-panel.toggle\"\ndescription = \"Toggle Git panel\"\n", original.trim_end());
+    let updated = format!("{}\n\n[[keys.command]]\nkey = \"cmd+shift+r\"\ntype = \"plugin_action\"\ncommand = \"{command}\"\ndescription = \"Toggle Git panel\"\n", original.trim_end());
     updated.parse::<toml_edit::DocumentMut>()?;
     atomic_write(&path, updated.as_bytes())?;
     Ok(true)
