@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.0] - 2026-10-27
+
+### Breaking
+
+- Rename the plugin id from `kingdee.git-panel` to `Zeppelinpp.git-panel` to match the publishing repository. Existing installations must relink or reinstall, because the registry id, managed plugin path, config directory and keybinding command all derive from the id.
+
+### Upgrade
+
+- Set the keybinding command to `Zeppelinpp.git-panel.toggle` in `~/.config/herdr/config.toml`, and move any settings from `plugins/config/kingdee.git-panel/config.json` to `plugins/config/Zeppelinpp.git-panel/config.json`.
+
 ## [0.4.2] - 2026-10-26
 
 First published release of Git Panel for Herdr.
