@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.7.0] - 2026-10-28
+
+### Features
+
+- Preview the selected file inline below the compact file lists. Collapsed commit history gives the preview the available space; expanded history shares it. Enter focuses the diff, Esc returns to files, and `o` opens a popup.
+- Show five context lines around each change, with fixed old/new line numbers, bounded inline emphasis, and expandable unchanged intervals. Missing context loads on demand against the displayed file version.
+- Select diff lines with `v`, mouse drag or Shift-click, then press `p` to choose a ready Herdr agent pane in the current workspace. Paste repository, file, comparison and line-numbered source into its input for submission there.
+
+### Performance and fixes
+
+- Render only viewport rows, coalesce fast file selection for 75ms, discard stale reads, and preserve loaded context and reading position across same-content refreshes.
+- Preserve file mode and missing-final-newline information; handle Unicode, Tab stops and scroll positions beyond 65,535 lines.
+- Keep review selections stable during repository refreshes, revalidate agent targets before delivery, and disable delivery when its picker is hidden or too small.
+
 ## [0.6.0] - 2026-10-27
 
 ### Fixed
