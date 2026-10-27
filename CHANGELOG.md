@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.3] - 2026-10-28
+
+### Added
+
+- Press `Shift+Enter` in an inline diff to open a larger popup covering 90% of the Herdr workspace width and 88% of its height. Working-tree, branch and history diffs share the existing viewer controls, including `v`, `p`, `Enter` and `a`.
+- Enable terminal keyboard disambiguation for modified Enter keys. Use `b` to expand folded context from the bottom in the inline view.
+- Configure the Git panel split direction as `right` or `down`.
+
+### Behavior
+
+- Open the popup from the current preview source while preserving the inline view's cursor, selection and folds. The popup reads its own current diff snapshot.
+
 ## [0.7.1] - 2026-10-28
 
 ### Added
