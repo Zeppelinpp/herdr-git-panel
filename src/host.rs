@@ -1,4 +1,4 @@
-use crate::git::{command, Repo};
+use crate::git::{command, DiffSource, Repo};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,220 @@ pub fn rpc(method: &str, params: Value) -> Result<Value> {
         .get("result")
         .cloned()
         .context("Herdr returned no result")
+}
+
+/// A ready agent in the caller's workspace. Pane identity is rechecked before
+/// delivery because a terminal may have closed or changed occupants meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentPane {
+    pub pane_id: String,
+    pub name: String,
+    pub kind: String,
+    pub status: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub(crate) terminal_id: String,
+    pub(crate) revision: u64,
+}
+
+fn agent_context() -> Result<(String, String)> {
+    if env::var("HERDR_ENV").as_deref() != Ok("1") {
+        bail!("Sending a selection requires a Herdr-managed pane");
+    }
+    let workspace = env::var("HERDR_WORKSPACE_ID")
+        .context("No Herdr workspace context; reopen the Git panel inside Herdr")?;
+    let pane = env::var("HERDR_PANE_ID")
+        .context("No Herdr pane context; reopen the Git panel inside Herdr")?;
+    if workspace.is_empty()
+        || pane.is_empty()
+        || env::var("HERDR_SOCKET_PATH").unwrap_or_default().is_empty()
+    {
+        bail!("Incomplete Herdr context; reopen the Git panel inside Herdr");
+    }
+    Ok((workspace, pane))
+}
+
+fn ready_agent(value: &Value) -> Option<AgentPane> {
+    let kind = value.get("agent")?.as_str()?.trim();
+    let status = value.get("agent_status")?.as_str()?;
+    if kind.is_empty()
+        || !matches!(status, "idle" | "done")
+        || value.get("launch_pending").and_then(Value::as_bool) == Some(true)
+        || value.get("interactive_ready").and_then(Value::as_bool) == Some(false)
+    {
+        return None;
+    }
+    let string = |key| {
+        value
+            .get(key)?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let name = ["name", "label", "title", "terminal_title_stripped"]
+        .into_iter()
+        .find_map(string)
+        .unwrap_or_else(|| kind.to_string());
+    let name = name
+        .chars()
+        .flat_map(|character| {
+            if character.is_control() {
+                character.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![character]
+            }
+        })
+        .collect();
+    Some(AgentPane {
+        pane_id: string("pane_id")?,
+        name,
+        kind: kind.to_string(),
+        status: status.to_string(),
+        workspace_id: string("workspace_id")?,
+        tab_id: string("tab_id")?,
+        terminal_id: string("terminal_id")?,
+        revision: value.get("revision")?.as_u64()?,
+    })
+}
+
+fn foreground_agent(target: &AgentPane) -> Result<bool> {
+    let result = rpc("pane.process_info", json!({"pane_id": target.pane_id}))?;
+    let processes = result
+        .pointer("/process_info/foreground_processes")
+        .and_then(Value::as_array)
+        .context("Herdr returned no foreground process information")?;
+    Ok(processes
+        .iter()
+        .any(|process| process_matches_agent(process, &target.kind)))
+}
+
+fn process_matches_agent(process: &Value, kind: &str) -> bool {
+    let kind = kind.to_ascii_lowercase().replace([' ', '_'], "-");
+    let aliases: &[&str] = match kind.as_str() {
+        "claude" | "claude-code" => &["claude", "claude-code"],
+        "pi" => &["pi", "pi-coding-agent"],
+        "gemini" => &["gemini", "gemini-cli"],
+        "cursor" => &["cursor", "cursor-agent"],
+        "agy" => &["agy", "antigravity"],
+        "qwen" => &["qwen", "qwen-code"],
+        "kilo" => &["kilo", "kilocode"],
+        "omp" => &["omp", "oh-my-pi"],
+        _ => &[kind.as_str()],
+    };
+    let executable_matches = |path: &str| {
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let name = name
+            .trim_end_matches(".exe")
+            .trim_end_matches(".js")
+            .trim_end_matches(".mjs");
+        aliases
+            .iter()
+            .any(|alias| name == *alias || name.starts_with(&format!("{alias}-")))
+    };
+    if ["name", "argv0"]
+        .into_iter()
+        .filter_map(|key| process.get(key).and_then(Value::as_str))
+        .any(executable_matches)
+    {
+        return true;
+    }
+    let Some(argv) = process.get("argv").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(executable) = argv.first().and_then(Value::as_str) else {
+        return false;
+    };
+    if executable_matches(executable) {
+        return true;
+    }
+    // Package CLIs can run directly under a JavaScript/Python interpreter.
+    // Inspect its script path, never arbitrary later command arguments.
+    let launcher = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !matches!(launcher, "node" | "bun" | "deno" | "python" | "python3") {
+        return false;
+    }
+    argv.get(1).and_then(Value::as_str).is_some_and(|script| {
+        executable_matches(script)
+            || Path::new(script).components().any(|component| {
+                component.as_os_str().to_str().is_some_and(|part| {
+                    let part = part.trim_start_matches('@');
+                    aliases.contains(&part)
+                })
+            })
+    })
+}
+
+pub fn available_agents() -> Result<Vec<AgentPane>> {
+    let (workspace, own_pane) = agent_context()?;
+    let result = rpc("agent.list", json!({}))?;
+    let agents = result
+        .get("agents")
+        .and_then(Value::as_array)
+        .context("Herdr returned no agent list")?;
+    let mut targets = Vec::new();
+    for agent in agents {
+        let Some(target) = ready_agent(agent) else {
+            continue;
+        };
+        if target.workspace_id == workspace
+            && target.pane_id != own_pane
+            && foreground_agent(&target).unwrap_or(false)
+        {
+            targets.push(target);
+        }
+    }
+    targets.sort_by(|a, b| (&a.name, &a.pane_id).cmp(&(&b.name, &b.pane_id)));
+    Ok(targets)
+}
+
+/// Paste into a revalidated agent's existing input. Submission remains a user
+/// action in that pane; this function never sends keys, focuses or clears it.
+pub fn send_selection(target: &AgentPane, text: &str) -> Result<()> {
+    let (workspace, own_pane) = agent_context()?;
+    if text.len() > 128 * 1024 {
+        bail!("Selection exceeds the 128 KiB delivery limit; select fewer lines");
+    }
+    if text.trim().is_empty()
+        || text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+    {
+        bail!("Selection is empty or contains unsupported control characters");
+    }
+    if target.workspace_id != workspace || target.pane_id == own_pane {
+        bail!("The target is outside this workspace or is the current pane");
+    }
+    let result = rpc("agent.get", json!({"target": target.pane_id}))
+        .context("The selected agent is no longer available; reopen the target list")?;
+    let current = result
+        .get("agent")
+        .and_then(ready_agent)
+        .context("The selected agent is no longer ready; reopen the target list")?;
+    if current.pane_id != target.pane_id
+        || current.workspace_id != target.workspace_id
+        || current.terminal_id != target.terminal_id
+        || current.revision != target.revision
+        || current.kind != target.kind
+    {
+        bail!("The selected pane changed occupants; reopen the target list");
+    }
+    if !foreground_agent(&current)? {
+        bail!("The agent is not in the foreground; reopen the target list when it is ready");
+    }
+    rpc(
+        "pane.send_text",
+        json!({"pane_id": target.pane_id, "text": text}),
+    )
+    .context(
+        "Delivery failed and may have reached the target; inspect its input before retrying",
+    )?;
+    Ok(())
 }
 fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
@@ -217,10 +431,12 @@ pub fn toggle() -> Result<()> {
     ])?;
     Ok(())
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DiffData {
     pub title: String,
     pub patch: String,
+    #[serde(default)]
+    pub source: Option<DiffSource>,
 }
 pub fn open_diff(data: &DiffData) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(state_dir()?)?;

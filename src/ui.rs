@@ -1,14 +1,16 @@
 use crate::{
+    diff_view::Viewer,
     git::{matching_branches, ChangeKind, FileStat, Mr, Repo, Snapshot},
     history::{Action as HistoryAction, History, Identity as GraphSelection, RowHit},
     host::{self, Config, DiffData},
+    preview::{Preview, Request as PreviewRequest, MIN_HEIGHT as MIN_PREVIEW_HEIGHT},
     theme::{Theme, INPUT_CURSOR, NAVIGATION},
     watch::{Changes, RepoWatch},
 };
 use anyhow::{bail, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     },
@@ -47,12 +49,13 @@ pub enum Focus {
     Mr,
     WorkingFiles,
     BranchFiles,
+    Diff,
     HistoryToggle,
     Graph,
     More,
     Link,
 }
-const FOCI: [Focus; 13] = [
+const FOCI: [Focus; 14] = [
     Focus::Base,
     Focus::Title,
     Focus::Description,
@@ -63,6 +66,7 @@ const FOCI: [Focus; 13] = [
     Focus::Link,
     Focus::WorkingFiles,
     Focus::BranchFiles,
+    Focus::Diff,
     Focus::HistoryToggle,
     Focus::Graph,
     Focus::More,
@@ -88,17 +92,11 @@ struct MrDialog {
     fields: Vec<TextArea<'static>>,
     selected: usize,
 }
-struct Viewer {
-    title: String,
-    patch: String,
-    vertical: u16,
-    horizontal: u16,
-}
 enum Dialog {
     Branches(Box<BranchDialog>),
     Mr(MrDialog),
     Push(String, String),
-    Diff(Viewer),
+    Diff(Box<Viewer>),
 }
 enum AutoData {
     Snapshot(Box<Snapshot>),
@@ -141,6 +139,10 @@ pub struct Panel {
     last_mr: String,
     dialog: Option<Dialog>,
     history: History,
+    preview: Preview,
+    preview_origin: Focus,
+    preview_area: Rect,
+    preview_refresh_pending: bool,
     file_cache: FileCache,
     working_files: ListState,
     branch_files: ListState,
@@ -258,6 +260,7 @@ impl Panel {
         title.set_placeholder_text("Commit title");
         let mut description = textarea("");
         description.set_placeholder_text("Description");
+        let preview = Preview::new(repo.clone());
         Self {
             repo,
             theme: Theme::load().unwrap_or_default(),
@@ -271,6 +274,10 @@ impl Panel {
             last_mr: String::new(),
             dialog: None,
             history: History::default(),
+            preview,
+            preview_origin: Focus::WorkingFiles,
+            preview_area: Rect::default(),
+            preview_refresh_pending: false,
             file_cache: FileCache::default(),
             working_files: ListState::default().with_selected(Some(0)),
             branch_files: ListState::default().with_selected(Some(0)),
@@ -335,6 +342,14 @@ impl Panel {
         });
     }
     fn receive(&mut self) {
+        self.dirty |= self.preview.poll();
+        if self.preview_refresh_pending && !self.preview.review_active() {
+            self.preview_refresh_pending = false;
+            self.refresh_preview();
+        }
+        if let Some(Dialog::Diff(viewer)) = &mut self.dialog {
+            self.dirty |= viewer.poll();
+        }
         let Ok(result) = self.receiver.try_recv() else {
             return;
         };
@@ -347,15 +362,27 @@ impl Panel {
             Err(e) => self.message = format!("{e:#}"),
             Ok(Update::Snapshot(snapshot)) => {
                 self.replace_snapshot(*snapshot);
+                self.refresh_preview();
                 self.message = self.refresh_notice.take().unwrap_or_default();
             }
             Ok(Update::Automatic(data)) => match data {
-                Some(AutoData::Snapshot(snapshot)) => self.replace_snapshot(*snapshot),
-                Some(AutoData::Working(status, working)) => self.replace_working(status, working),
+                Some(AutoData::Snapshot(snapshot)) => {
+                    self.replace_snapshot(*snapshot);
+                    self.refresh_preview();
+                }
+                Some(AutoData::Working(status, working)) => {
+                    self.replace_working(status, working);
+                    if self.preview_origin == Focus::WorkingFiles {
+                        self.refresh_preview();
+                    } else {
+                        self.sync_preview();
+                    }
+                }
                 None => (),
             },
             Ok(Update::Details(sha, summary, files)) => {
                 self.history.expand(sha, summary, files);
+                self.sync_preview();
                 self.message.clear();
             }
             Ok(Update::Committed(out)) => {
@@ -380,12 +407,8 @@ impl Panel {
                     });
                 } else {
                     self.message.clear();
-                    self.dialog = Some(Dialog::Diff(Viewer {
-                        title: data.title,
-                        patch: data.patch,
-                        vertical: 0,
-                        horizontal: 0,
-                    }));
+                    self.dialog =
+                        Some(Dialog::Diff(Box::new(Viewer::new(data, self.wake.clone()))));
                 }
             }
             Ok(Update::Done) => self.message.clear(),
@@ -463,6 +486,64 @@ impl Panel {
             .get(self.working_files.selected()?)
             .map(|file| (file.kind, file.stat.path.clone()))
     }
+
+    fn sync_preview(&mut self) -> bool {
+        self.preview_refresh_pending = false;
+        let working = self
+            .working_key()
+            .map(|(kind, path)| PreviewRequest::Working { kind, path });
+        let branch = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .files
+                .get(self.branch_files.selected()?)
+                .map(|file| PreviewRequest::Branch {
+                    base: snapshot.base.clone(),
+                    path: file.path.clone(),
+                })
+        });
+        let request = match self.preview_origin {
+            Focus::Graph => match self.history.selection() {
+                Some(GraphSelection::File(sha, path)) => Some(PreviewRequest::Commit { sha, path }),
+                _ => None,
+            },
+            Focus::BranchFiles if branch.is_some() => branch,
+            _ if working.is_some() => {
+                self.preview_origin = Focus::WorkingFiles;
+                working
+            }
+            _ => {
+                self.preview_origin = Focus::BranchFiles;
+                branch
+            }
+        };
+        self.preview.select(request, self.wake.clone())
+    }
+
+    fn refresh_preview(&mut self) {
+        if self.preview.review_active() {
+            self.preview_refresh_pending = true;
+            return;
+        }
+        // Unchanged statistics can still contain different text after a save.
+        if !self.sync_preview() {
+            self.preview.invalidate(self.wake.clone());
+        }
+    }
+
+    fn focus_preview(&mut self, origin: Focus) {
+        self.preview_origin = origin;
+        self.sync_preview();
+        if self.can_focus(Focus::Diff) {
+            self.focus = Focus::Diff;
+        }
+    }
+
+    fn leave_preview(&mut self) {
+        self.focus = self.preview_origin;
+        if !self.can_focus(self.focus) {
+            self.change_focus(false);
+        }
+    }
     fn restore_working_selection(&mut self, key: Option<(ChangeKind, String)>, old_index: usize) {
         let files = &self.snapshot.as_ref().unwrap().working.files;
         let selected = key
@@ -513,11 +594,18 @@ impl Panel {
                 continue;
             }
             self.focus = focus;
+            if matches!(
+                focus,
+                Focus::WorkingFiles | Focus::BranchFiles | Focus::Graph
+            ) {
+                self.preview_origin = focus;
+                self.sync_preview();
+            }
             break;
         }
     }
     fn can_focus(&self, focus: Focus) -> bool {
-        if self.busy() && !self.background_refresh {
+        if self.busy() && !self.background_refresh && focus != Focus::Diff {
             return false;
         }
         match focus {
@@ -551,6 +639,11 @@ impl Panel {
                 .as_ref()
                 .is_some_and(|s| !s.working.files.is_empty()),
             Focus::BranchFiles => self.snapshot.as_ref().is_some_and(|s| !s.files.is_empty()),
+            Focus::Diff => {
+                self.preview.available()
+                    && (self.preview.captures_input()
+                        || self.preview_area.height >= MIN_PREVIEW_HEIGHT)
+            }
             Focus::HistoryToggle => self.history.count() > 0,
             Focus::Graph => !self.history.folded() && self.history.count() > 0,
             Focus::More => !self.history.folded() && self.history.count() >= self.limit,
@@ -574,9 +667,7 @@ impl Panel {
                     Ok(Update::Details(sha, summary, files))
                 });
             }
-            Some(HistoryAction::OpenFile { sha, path }) => {
-                self.open_patch(String::new(), sha, path)
-            }
+            Some(HistoryAction::OpenFile { .. }) => self.focus_preview(Focus::Graph),
             None => (),
         }
     }
@@ -594,18 +685,7 @@ impl Panel {
     fn open_patch(&mut self, base: String, sha: String, path: String) {
         let repo = self.repo.clone();
         self.work("Reading diff…", move || {
-            Ok(Update::Diff(DiffData {
-                title: format!(
-                    "{} · {}",
-                    if sha.is_empty() {
-                        format!("{base}…HEAD")
-                    } else {
-                        sha[..8.min(sha.len())].to_string()
-                    },
-                    visible(&path)
-                ),
-                patch: repo.patch(&base, &sha, &path)?,
-            }))
+            Ok(Update::Diff(repo.diff_data(&base, &sha, &path)?))
         });
     }
     fn open_working_file(&mut self, index: usize) {
@@ -619,10 +699,7 @@ impl Panel {
         };
         let repo = self.repo.clone();
         self.work("Reading working tree diff…", move || {
-            Ok(Update::Diff(DiffData {
-                title: format!("{} · {}", file.kind.label(), visible(&file.stat.path)),
-                patch: repo.working_patch(&file)?,
-            }))
+            Ok(Update::Diff(repo.working_diff_data(&file)?))
         });
     }
     fn capture_activation(&self) -> Option<Activation> {
@@ -739,10 +816,8 @@ impl Panel {
             }
             Focus::Graph => self.select_graph(),
             Focus::HistoryToggle => self.toggle_history(),
-            Focus::BranchFiles => self.open_file(self.branch_files.selected().unwrap_or(0)),
-            Focus::WorkingFiles => {
-                self.open_working_file(self.working_files.selected().unwrap_or(0))
-            }
+            Focus::BranchFiles => self.focus_preview(Focus::BranchFiles),
+            Focus::WorkingFiles => self.focus_preview(Focus::WorkingFiles),
             Focus::More => {
                 self.limit += self.cfg.history_limit;
                 self.refresh();
@@ -767,12 +842,28 @@ impl Panel {
             ),
             _ => (),
         }
+        if matches!(
+            self.focus,
+            Focus::WorkingFiles | Focus::BranchFiles | Focus::Graph
+        ) {
+            self.preview_origin = self.focus;
+            self.sync_preview();
+        }
     }
     pub fn key(&mut self, key: KeyEvent) -> Result<bool> {
         if let Some(mut dialog) = self.dialog.take() {
             let close = self.dialog_key(&mut dialog, key)?;
             if !close {
                 self.dialog = Some(dialog);
+            }
+            return Ok(false);
+        }
+        if self.focus == Focus::Diff
+            && (self.preview.captures_input()
+                || matches!(key.code, KeyCode::Esc | KeyCode::Char('q')))
+        {
+            if self.preview.key(key) {
+                self.leave_preview();
             }
             return Ok(false);
         }
@@ -805,7 +896,33 @@ impl Panel {
             self.activate()?;
             return Ok(false);
         }
+        if self.focus == Focus::Diff {
+            if self.preview.key(key) {
+                self.leave_preview();
+            }
+            return Ok(false);
+        }
         if self.busy() && !self.background_refresh {
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('o')
+            && matches!(
+                self.focus,
+                Focus::WorkingFiles | Focus::BranchFiles | Focus::Graph
+            )
+        {
+            match self.focus {
+                Focus::WorkingFiles => {
+                    self.open_working_file(self.working_files.selected().unwrap_or(0))
+                }
+                Focus::BranchFiles => self.open_file(self.branch_files.selected().unwrap_or(0)),
+                Focus::Graph => {
+                    if let Some(GraphSelection::File(sha, path)) = self.history.selection() {
+                        self.open_patch(String::new(), sha, path);
+                    }
+                }
+                _ => (),
+            }
             return Ok(false);
         }
         match self.focus {
@@ -827,7 +944,7 @@ impl Panel {
         Ok(false)
     }
     fn dialog_key(&mut self, dialog: &mut Dialog, key: KeyEvent) -> Result<bool> {
-        if key.code == KeyCode::Esc {
+        if key.code == KeyCode::Esc && !matches!(dialog, Dialog::Diff(_)) {
             return Ok(true);
         }
         match dialog {
@@ -881,7 +998,7 @@ impl Panel {
                 _ => (),
             },
             Dialog::Diff(viewer) => {
-                if viewer_key(viewer, key) {
+                if viewer.key(key) {
                     return Ok(true);
                 }
             }
@@ -904,6 +1021,21 @@ impl Panel {
         });
     }
     fn mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.dialog.is_none()
+            && (self.preview_area.contains((mouse.column, mouse.row).into())
+                || self.preview.captures_input()
+                || self.preview.mouse_captured())
+        {
+            if self.preview.available() {
+                self.focus = Focus::Diff;
+                self.preview.mouse(mouse);
+            }
+            return Ok(());
+        }
+        if let Some(Dialog::Diff(viewer)) = &mut self.dialog {
+            viewer.mouse(mouse);
+            return Ok(());
+        }
         if matches!(
             mouse.kind,
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
@@ -914,20 +1046,14 @@ impl Panel {
                 -1
             };
             if let Some(dialog) = &mut self.dialog {
-                match dialog {
-                    Dialog::Branches(branch) => {
-                        let count = self.snapshot.as_ref().map_or(0, |s| {
-                            matching_branches(&s.branches, &text(&branch.query)).len()
-                        });
-                        branch.selected = branch
-                            .selected
-                            .saturating_add_signed(delta)
-                            .min(count.saturating_sub(1));
-                    }
-                    Dialog::Diff(viewer) => {
-                        viewer.vertical = viewer.vertical.saturating_add_signed(delta as i16 * 3)
-                    }
-                    _ => (),
+                if let Dialog::Branches(branch) = dialog {
+                    let count = self.snapshot.as_ref().map_or(0, |s| {
+                        matching_branches(&s.branches, &text(&branch.query)).len()
+                    });
+                    branch.selected = branch
+                        .selected
+                        .saturating_add_signed(delta)
+                        .min(count.saturating_sub(1));
                 }
             } else {
                 if let Some((_, hit)) = self
@@ -1003,6 +1129,13 @@ impl Panel {
                         return Ok(());
                     }
                     self.focus = focus;
+                    if matches!(
+                        focus,
+                        Focus::WorkingFiles | Focus::BranchFiles | Focus::Graph
+                    ) {
+                        self.preview_origin = focus;
+                        self.sync_preview();
+                    }
                     if !matches!(
                         focus,
                         Focus::Title
@@ -1010,6 +1143,7 @@ impl Panel {
                             | Focus::Graph
                             | Focus::BranchFiles
                             | Focus::WorkingFiles
+                            | Focus::Diff
                     ) {
                         self.activate()?;
                     }
@@ -1017,18 +1151,24 @@ impl Panel {
                 Hit::GraphRow(index) => {
                     self.focus = Focus::Graph;
                     self.history.select_row(index);
-                    self.activate()?;
+                    self.preview_origin = Focus::Graph;
+                    self.sync_preview();
+                    if matches!(self.history.selection(), Some(GraphSelection::Commit(_))) {
+                        self.activate()?;
+                    }
                 }
                 Hit::FileRow(focus, index) => {
                     self.focus = focus;
                     match focus {
                         Focus::WorkingFiles => {
                             self.working_files.select(Some(index));
-                            self.activate()?;
+                            self.preview_origin = focus;
+                            self.sync_preview();
                         }
                         Focus::BranchFiles => {
                             self.branch_files.select(Some(index));
-                            self.activate()?;
+                            self.preview_origin = focus;
+                            self.sync_preview();
                         }
                         _ => (),
                     }
@@ -1058,6 +1198,8 @@ impl Panel {
                 if matches!(
                     mouse.kind,
                     MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left)
+                        | MouseEventKind::Up(MouseButton::Left)
                         | MouseEventKind::ScrollUp
                         | MouseEventKind::ScrollDown
                 ) =>
@@ -1102,10 +1244,12 @@ impl Panel {
         self.hits.clear();
         let area = frame.area();
         if area.width < 26 || area.height < 22 {
-            frame.render_widget(
-                Paragraph::new("Resize panel to at least 26 × 22. Esc closes."),
-                area,
-            );
+            self.preview_area = Rect::default();
+            self.preview.hide_review();
+            if let Some(Dialog::Diff(viewer)) = &mut self.dialog {
+                viewer.hide_review();
+            }
+            frame.render_widget(Paragraph::new("Resize panel to at least 26 × 22."), area);
             self.theme.apply(frame.buffer_mut());
             return;
         }
@@ -1286,7 +1430,7 @@ impl Panel {
             frame,
             outer[8],
             &format!(
-                "Tab focus  Enter open  ^R refresh  {} push  Esc close",
+                "Tab focus  Enter diff  o popup  ^R refresh  {} push  Esc close",
                 self.cfg.push_key
             ),
         );
@@ -1338,31 +1482,50 @@ impl Panel {
         let available = area.height.saturating_sub(footer_height);
         let working_min = if working_count > 0 { 2 } else { 1 };
         let branch_min = if file_count > 0 { 2 } else { 1 };
-        let (working_height, branch_height, history_height) = if self.history.folded() {
-            let working_wanted = working_count
-                .saturating_add(1)
-                .min(available.saturating_sub(1 + branch_min) as usize)
-                as u16;
-            let branch = available.saturating_sub(1 + working_wanted);
-            (working_wanted, branch, 1)
+        let history_min = if self.history.folded() { 1 } else { 3 };
+        let preview_min = if available >= MIN_PREVIEW_HEIGHT + 4 {
+            MIN_PREVIEW_HEIGHT
         } else {
-            let branch_max = available.saturating_sub(3 + working_min);
-            let branch = (file_count.saturating_add(1).min(4) as u16)
-                .min(branch_max)
-                .max(branch_min.min(branch_max));
-            let working_max = available.saturating_sub(3 + branch);
-            let working = (working_count.saturating_add(1).min(6) as u16)
-                .min(working_max)
-                .max(working_min.min(working_max));
-            (working, branch, available.saturating_sub(working + branch))
+            0
+        };
+        let working_max = available.saturating_sub(history_min + branch_min + preview_min);
+        let working_height = (working_count
+            .saturating_add(1)
+            .min(if self.history.folded() { 8 } else { 6 }) as u16)
+            .min(working_max)
+            .max(working_min.min(working_max));
+        let branch_max = available.saturating_sub(history_min + working_height + preview_min);
+        let branch_height = (file_count.saturating_add(1).min(4) as u16)
+            .min(branch_max)
+            .max(branch_min.min(branch_max));
+        let remaining = available.saturating_sub(working_height + branch_height);
+        let (preview_height, history_height) = if self.history.folded() {
+            (remaining.saturating_sub(1), remaining.min(1))
+        } else {
+            let preview = if remaining >= MIN_PREVIEW_HEIGHT + 3 {
+                (remaining / 2).max(MIN_PREVIEW_HEIGHT)
+            } else {
+                0
+            };
+            (preview, remaining.saturating_sub(preview))
         };
         let layout = Layout::vertical([
             Constraint::Length(working_height),
             Constraint::Length(branch_height),
+            Constraint::Length(preview_height),
             Constraint::Length(history_height),
             Constraint::Length(footer_height),
         ])
         .split(area);
+        self.preview_area = layout[2];
+        if self.focus == Focus::Diff && !self.can_focus(Focus::Diff) {
+            self.leave_preview();
+        }
+        self.preview
+            .render(frame, self.preview_area, self.focus == Focus::Diff);
+        if !self.preview_area.is_empty() && self.preview.available() {
+            self.hits.push((self.preview_area, Hit::Focus(Focus::Diff)));
+        }
         render_files(
             frame,
             layout[0],
@@ -1411,7 +1574,7 @@ impl Panel {
         );
         if self.snapshot.is_some() {
             let count = self.history.count();
-            let header = Rect::new(layout[2].x, layout[2].y, layout[2].width, 1);
+            let header = Rect::new(layout[3].x, layout[3].y, layout[3].width, 1);
             let label = format!(
                 "{} COMMITS {count}{}",
                 if self.history.folded() { "›" } else { "▾" },
@@ -1436,10 +1599,10 @@ impl Panel {
             }
             self.hits.push((refresh, Hit::Refresh));
             let body = Rect::new(
-                layout[2].x,
-                layout[2].y + 1,
-                layout[2].width,
-                layout[2].height.saturating_sub(1),
+                layout[3].x,
+                layout[3].y + 1,
+                layout[3].width,
+                layout[3].height.saturating_sub(1),
             );
             if !self.history.folded() {
                 self.hits.push((body, Hit::Focus(Focus::Graph)));
@@ -1450,7 +1613,7 @@ impl Panel {
             }
         }
         if show_more {
-            let more = Rect::new(layout[3].x, layout[3].y, layout[3].width, 1);
+            let more = Rect::new(layout[4].x, layout[4].y, layout[4].width, 1);
             frame.render_widget(
                 Paragraph::new("[Load older commits]").style(if self.focus == Focus::More {
                     SELECTED
@@ -1622,7 +1785,7 @@ impl Panel {
             Dialog::Diff(viewer) => {
                 let area = dialog_area(frame.area(), frame.area().width, frame.area().height);
                 frame.render_widget(Clear, area);
-                render_viewer(frame, area, viewer);
+                viewer.render(frame, area);
             }
         }
     }
@@ -1710,62 +1873,6 @@ fn render_files(
         hits.push((Rect::new(area.x, area.y, area.width, 1), Hit::Focus(focus)));
     }
 }
-fn viewer_key(viewer: &mut Viewer, key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => return true,
-        KeyCode::Down | KeyCode::Char('j') => viewer.vertical = viewer.vertical.saturating_add(1),
-        KeyCode::Up | KeyCode::Char('k') => viewer.vertical = viewer.vertical.saturating_sub(1),
-        KeyCode::PageDown => viewer.vertical = viewer.vertical.saturating_add(15),
-        KeyCode::PageUp => viewer.vertical = viewer.vertical.saturating_sub(15),
-        KeyCode::Right => viewer.horizontal = viewer.horizontal.saturating_add(4),
-        KeyCode::Left => viewer.horizontal = viewer.horizontal.saturating_sub(4),
-        KeyCode::Home => {
-            viewer.vertical = 0;
-            viewer.horizontal = 0;
-        }
-        _ => (),
-    };
-    false
-}
-fn render_viewer(frame: &mut Frame, area: Rect, viewer: &Viewer) {
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    frame.render_widget(Paragraph::new(visible(&viewer.title)).style(BOLD), rows[0]);
-    let lines = viewer
-        .patch
-        .lines()
-        .map(|line| {
-            let style = if line.starts_with("diff ")
-                || line.starts_with("---")
-                || line.starts_with("+++")
-            {
-                BOLD
-            } else if line.starts_with('+') {
-                NORMAL.fg(Color::Green)
-            } else if line.starts_with('-') {
-                NORMAL.fg(Color::Red)
-            } else if line.starts_with("@@") {
-                NORMAL.fg(Color::Cyan)
-            } else {
-                NORMAL
-            };
-            Line::styled(line.replace('\t', "    "), style)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(lines).scroll((viewer.vertical, viewer.horizontal)),
-        rows[1],
-    );
-    footer(
-        frame,
-        rows[2],
-        "↑↓ scroll  ←→ horizontal  PgUp/PgDn  Esc/q close",
-    );
-}
 fn open_url(url: &str) -> Result<()> {
     if !matches!(url::Url::parse(url)?.scheme(), "http" | "https") {
         bail!("Only HTTP links can be opened");
@@ -1829,12 +1936,16 @@ pub fn run(repo: Repo, cfg: Config) -> Result<()> {
             }
         }
         panel.draw_pending(&mut terminal)?;
-        // No recurring timer: native notifications and completed workers wake
-        // the loop; a deadline exists only while a change burst is settling.
-        let timeout = if panel.busy() || panel.dialog.is_some() {
+        // Deadlines exist only while repository events or a new file selection
+        // settle. An idle panel blocks until input, notification or completion.
+        let watch_timeout = if panel.busy() || panel.dialog.is_some() {
             None
         } else {
             watch.as_ref().and_then(|w| w.wait(Instant::now()))
+        };
+        let timeout = match (watch_timeout, panel.preview.wait(Instant::now())) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         };
         let Some(event) = events.next(timeout)? else {
             continue;
@@ -1855,29 +1966,43 @@ pub fn run(repo: Repo, cfg: Config) -> Result<()> {
 }
 pub fn run_diff(data: DiffData) -> Result<()> {
     let theme = Theme::load()?;
-    let mut viewer = Viewer {
-        title: data.title,
-        patch: data.patch,
-        vertical: 0,
-        horizontal: 0,
-    };
     let (mut terminal, _guard) = terminal()?;
+    let events = crate::runtime::Events::start()?;
+    let mut viewer = Viewer::new(data, Some(events.waker()));
+    let mut dirty = true;
     loop {
-        terminal.draw(|frame| {
-            render_viewer(frame, frame.area(), &viewer);
-            theme.apply(frame.buffer_mut());
-        })?;
-        match event::read()? {
+        dirty |= viewer.poll();
+        if dirty {
+            terminal.draw(|frame| {
+                viewer.render(frame, frame.area());
+                theme.apply(frame.buffer_mut());
+            })?;
+            dirty = false;
+        }
+        let Some(event) = events.next(None)? else {
+            continue;
+        };
+        match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if viewer_key(&mut viewer, key) {
+                if viewer.key(key) {
                     break;
                 }
+                dirty = true;
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollDown => viewer.vertical = viewer.vertical.saturating_add(3),
-                MouseEventKind::ScrollUp => viewer.vertical = viewer.vertical.saturating_sub(3),
-                _ => (),
-            },
+            Event::Mouse(mouse)
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollDown
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left)
+                        | MouseEventKind::Up(MouseButton::Left)
+                ) =>
+            {
+                viewer.mouse(mouse);
+                dirty = true;
+            }
+            Event::Resize(_, _) | Event::FocusGained => dirty = true,
             _ => (),
         }
     }
@@ -2628,6 +2753,247 @@ mod tests {
             .iter()
             .any(|line| line.contains("Committed on branch · no changes")));
     }
+    fn inline_fixture() -> (tempfile::TempDir, Panel) {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let result = Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Inline Test"]);
+        git(&["config", "user.email", "inline@example.invalid"]);
+        std::fs::write(root.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "Base"]);
+        std::fs::write(root.path().join("a.txt"), "FIRST_INLINE_CONTENT\n").unwrap();
+        std::fs::write(root.path().join("b.txt"), "SECOND_INLINE_CONTENT\n").unwrap();
+        let repo = Repo::discover(root.path()).unwrap();
+        let snapshot = repo.snapshot("main", 100).unwrap();
+        let mut panel = Panel::new(
+            repo,
+            Config {
+                auto_refresh: false,
+                ..Config::default()
+            },
+        );
+        panel
+            .sender
+            .send(Ok(Update::Snapshot(Box::new(snapshot))))
+            .unwrap();
+        panel.receive();
+        (root, panel)
+    }
+
+    fn inline_screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn wait_inline(panel: &mut Panel, terminal: &mut Terminal<TestBackend>, content: &str) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            panel.receive();
+            panel.draw_pending(terminal).unwrap();
+            if inline_screen(terminal).contains(content) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "inline preview missing {content}"
+            );
+            thread::sleep(std::time::Duration::from_millis(3));
+        }
+        assert!(panel.dialog.is_none());
+    }
+
+    #[test]
+    fn selection_previews_without_popup_and_enter_escape_only_move_focus() {
+        let (_root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        panel.focus = Focus::WorkingFiles;
+        panel.key(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert_eq!(panel.focus, Focus::Diff);
+        wait_inline(&mut panel, &mut terminal, "SECOND_INLINE_CONTENT");
+        assert!(!panel.key(KeyEvent::from(KeyCode::Esc)).unwrap());
+        assert_eq!(panel.focus, Focus::WorkingFiles);
+        let rect = panel
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| {
+                matches!(hit, Hit::FileRow(Focus::WorkingFiles, 0)).then_some(*rect)
+            })
+            .unwrap();
+        panel
+            .handle_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+        assert_eq!(panel.focus, Focus::WorkingFiles);
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        assert!(
+            panel.worker.is_none(),
+            "inline browsing must not open a popup worker"
+        );
+    }
+
+    #[test]
+    fn folded_history_gives_preview_the_free_space_and_expanded_history_shares_it() {
+        let (_root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 50)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        let folded = panel.preview_area;
+        let header = panel
+            .hits
+            .iter()
+            .find(|(_, hit)| matches!(hit, Hit::ToggleGraph))
+            .unwrap()
+            .0;
+        assert!(folded.height > 20);
+        assert_eq!(folded.bottom(), header.y);
+        panel.toggle_history();
+        terminal.draw(|f| panel.render(f)).unwrap();
+        assert!(panel.preview_area.height >= 4);
+        assert!(panel.preview_area.height < folded.height);
+        assert!(panel
+            .hits
+            .iter()
+            .any(|(_, hit)| matches!(hit, Hit::GraphRow(_))));
+        panel.toggle_history();
+        terminal.draw(|f| panel.render(f)).unwrap();
+        assert_eq!(panel.preview_area, folded);
+    }
+
+    #[test]
+    fn very_short_panels_do_not_focus_a_preview_without_a_code_row() {
+        let (_root, mut panel) = inline_fixture();
+        for height in [18, 24] {
+            let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+            terminal.draw(|f| panel.render(f)).unwrap();
+            assert!(panel.preview_area.height < MIN_PREVIEW_HEIGHT);
+            assert!(!panel.can_focus(Focus::Diff));
+            panel.focus = Focus::WorkingFiles;
+            panel.focus_preview(Focus::WorkingFiles);
+            assert_eq!(panel.focus, Focus::WorkingFiles);
+        }
+    }
+
+    #[test]
+    fn file_save_refreshes_inline_content_even_when_file_statistics_match() {
+        let (root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        panel.title.insert_str("Keep draft");
+        let before = panel.snapshot.as_ref().unwrap().working.clone();
+        std::fs::write(root.path().join("a.txt"), "UPDATED_INLINE_TEXT\n").unwrap();
+        let (status, working) = panel.repo.worktree_snapshot().unwrap();
+        assert_eq!(working, before);
+        panel
+            .sender
+            .send(Ok(Update::Automatic(Some(AutoData::Working(
+                status, working,
+            )))))
+            .unwrap();
+        panel.receive();
+        wait_inline(&mut panel, &mut terminal, "UPDATED_INLINE_TEXT");
+        assert_eq!(text(&panel.title), "Keep draft");
+        assert_eq!(panel.working_files.selected(), Some(0));
+    }
+
+    #[test]
+    fn inline_preview_initially_shows_five_context_lines_on_each_side() {
+        let (root, mut panel) = inline_fixture();
+        let original: String = (1..=100).map(|i| format!("context_{i:03}\n")).collect();
+        std::fs::write(root.path().join("code.txt"), &original).unwrap();
+        for args in [vec!["add", "code.txt"], vec!["commit", "-m", "Code"]] {
+            let result = Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+        }
+        std::fs::write(
+            root.path().join("code.txt"),
+            original.replace("context_050", "INLINE_CHANGE"),
+        )
+        .unwrap();
+        let snapshot = panel.repo.snapshot("main", 100).unwrap();
+        panel.replace_snapshot(snapshot);
+        let index = panel
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .working
+            .files
+            .iter()
+            .position(|f| f.stat.path == "code.txt")
+            .unwrap();
+        panel.working_files.select(Some(index));
+        panel.preview_origin = Focus::WorkingFiles;
+        panel.sync_preview();
+        let mut terminal = Terminal::new(TestBackend::new(100, 55)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "INLINE_CHANGE");
+        let screen = inline_screen(&terminal);
+        for i in [45, 46, 47, 48, 49, 51, 52, 53, 54, 55] {
+            assert!(
+                screen.contains(&format!("context_{i:03}")),
+                "missing context line {i}"
+            );
+        }
+        assert!(!screen.contains("context_044"));
+        assert!(!screen.contains("context_056"));
+    }
+
+    #[test]
+    fn review_selection_survives_file_removal_until_escape_releases_it() {
+        let (root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        panel.focus_preview(Focus::WorkingFiles);
+        panel.key(KeyEvent::from(KeyCode::Char('v'))).unwrap();
+        std::fs::remove_file(root.path().join("a.txt")).unwrap();
+        let (status, working) = panel.repo.worktree_snapshot().unwrap();
+        panel
+            .sender
+            .send(Ok(Update::Automatic(Some(AutoData::Working(
+                status, working,
+            )))))
+            .unwrap();
+        panel.receive();
+        terminal.draw(|f| panel.render(f)).unwrap();
+        assert!(inline_screen(&terminal).contains("FIRST_INLINE_CONTENT"));
+        assert!(panel.preview_refresh_pending);
+        assert!(!panel.key(KeyEvent::from(KeyCode::Esc)).unwrap());
+        assert_eq!(
+            panel.focus,
+            Focus::Diff,
+            "first Escape cancels the selection"
+        );
+        wait_inline(&mut panel, &mut terminal, "SECOND_INLINE_CONTENT");
+        assert!(!panel.key(KeyEvent::from(KeyCode::Esc)).unwrap());
+        assert_eq!(panel.focus, Focus::WorkingFiles);
+    }
+
     fn fixture() -> Panel {
         let mut panel = Panel::new(
             Repo {

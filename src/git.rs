@@ -2,8 +2,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    fs,
     io::{Read, Write},
-    os::unix::{ffi::OsStrExt, process::CommandExt},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -15,13 +16,248 @@ use wait_timeout::ChildExt;
 pub struct Repo {
     pub path: PathBuf,
 }
+/// A refreshable diff request and the immutable new-side content it describes.
+/// Worktree content is read only on expansion, guarded by a metadata stamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffSource {
+    repo: PathBuf,
+    request: DiffRequest,
+    content: ContextSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum DiffRequest {
+    Comparison {
+        base: String,
+        commit: String,
+        path: String,
+    },
+    Working {
+        kind: ChangeKind,
+        path: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum ContextSource {
+    Blob(String),
+    Worktree {
+        path: String,
+        stamp: Option<FileStamp>,
+        blob: Option<String>,
+    },
+    Empty,
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    mode: u32,
+}
+
+impl FileStamp {
+    fn read(path: &Path) -> Result<Option<Self>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
+        }))
+    }
+}
+
+impl DiffSource {
+    /// Stable source context for a review selection; labels never need to be
+    /// reverse-parsed from the viewer's presentation title.
+    pub fn review_context(&self) -> String {
+        let (path, comparison) = match &self.request {
+            DiffRequest::Comparison { base, commit, path } => (
+                path,
+                if commit.is_empty() {
+                    format!("{}…HEAD (committed branch changes)", display_path(base))
+                } else {
+                    format!("commit {} (first-parent change)", display_path(commit))
+                },
+            ),
+            DiffRequest::Working { kind, path } => (
+                path,
+                match kind {
+                    ChangeKind::Unstaged => "index → worktree (unstaged)",
+                    ChangeKind::Staged => "HEAD → index (staged)",
+                    ChangeKind::Untracked => "empty → worktree (untracked)",
+                }
+                .into(),
+            ),
+        };
+        let mut context = format!(
+            "Repository: {}\nFile: {}\nComparison: {comparison}\n",
+            display_path(&self.repo.to_string_lossy()),
+            display_path(path),
+        );
+        let blob = match &self.content {
+            ContextSource::Blob(blob) => Some(blob),
+            ContextSource::Worktree { blob, .. } => blob.as_ref(),
+            _ => None,
+        };
+        if let Some(blob) = blob {
+            context.push_str(&format!("New-side blob: {}\n", display_path(blob)));
+        }
+        context
+    }
+
+    /// A rewritten worktree file can retain exactly the same Git content while
+    /// its metadata stamp changes. The refreshed stamp still replaces the old
+    /// one before any future context read.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        if self.repo != other.repo || self.request != other.request {
+            return false;
+        }
+        match (&self.content, &other.content) {
+            (
+                ContextSource::Worktree {
+                    path: a,
+                    blob: Some(old),
+                    ..
+                },
+                ContextSource::Worktree {
+                    path: b,
+                    blob: Some(new),
+                    ..
+                },
+            ) => a == b && old == new,
+            (a, b) => a == b,
+        }
+    }
+
+    pub fn load_context(&self) -> Result<String> {
+        let repo = Repo {
+            path: self.repo.clone(),
+        };
+        let text = match &self.content {
+            ContextSource::Empty => String::new(),
+            ContextSource::Unavailable(reason) => bail!("{reason}"),
+            ContextSource::Blob(oid) => repo.git(&["cat-file", "blob", oid])?,
+            ContextSource::Worktree { path, stamp, blob } => {
+                let path = self.repo.join(path);
+                let check = || -> Result<()> {
+                    if FileStamp::read(&path)? != *stamp {
+                        bail!("File changed since this diff opened; press r to refresh before expanding");
+                    }
+                    Ok(())
+                };
+                check()?;
+                let mut text = if stamp.is_none() {
+                    String::new()
+                } else if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                    fs::read_link(&path)?.to_string_lossy().into_owned()
+                } else {
+                    String::from_utf8(fs::read(&path)?)
+                        .context("File is not UTF-8 text; context cannot be expanded")?
+                };
+                check()?;
+                // Git may normalize CRLF before diffing. Only attach content
+                // that hashes to the new side named by the patch; arbitrary
+                // clean filters cannot safely be reproduced by a raw read.
+                if let Some(blob) = blob.as_ref().filter(|oid| !oid.chars().all(|c| c == '0')) {
+                    let hash = |content: &str| -> Result<String> {
+                        command_accept_input(
+                            "git",
+                            &["hash-object".into(), "--stdin".into()],
+                            &repo.path,
+                            120,
+                            &[0],
+                            Some(content.as_bytes().to_vec()),
+                        )
+                    };
+                    if hash(&text)?.trim() != blob {
+                        let normalized = text.replace("\r\n", "\n");
+                        if normalized != text && hash(&normalized)?.trim() == blob {
+                            text = normalized;
+                        } else {
+                            bail!("File content differs from Git's diff representation; context cannot be expanded");
+                        }
+                    }
+                }
+                text
+            }
+        };
+        if text.contains('\0') {
+            bail!("Binary file context cannot be expanded");
+        }
+        Ok(text)
+    }
+
+    pub fn reload(&self) -> Result<crate::host::DiffData> {
+        let repo = Repo {
+            path: self.repo.clone(),
+        };
+        match &self.request {
+            DiffRequest::Comparison { base, commit, path } => repo.diff_data(base, commit, path),
+            DiffRequest::Working { kind, path } => repo.working_diff_data(&WorkingFile {
+                stat: FileStat {
+                    path: path.clone(),
+                    added: String::new(),
+                    deleted: String::new(),
+                },
+                kind: *kind,
+            }),
+        }
+    }
+}
+
+fn display_path(path: &str) -> String {
+    path.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+fn is_gitlink(patch: &str) -> bool {
+    patch
+        .lines()
+        .take_while(|line| !line.starts_with("@@"))
+        .any(|line| {
+            (line.starts_with("index ") && line.ends_with(" 160000"))
+                || line == "new file mode 160000"
+                || line == "deleted file mode 160000"
+        })
+}
+
+/// Full-index headers identify exactly the new blob used to make a patch.
+fn new_blob(patch: &str) -> Option<&str> {
+    patch
+        .lines()
+        .take_while(|line| !line.starts_with("@@"))
+        .find_map(|line| line.strip_prefix("index "))
+        .and_then(|line| line.split_once(".."))
+        .map(|(_, new)| new.split_whitespace().next().unwrap_or(""))
+        .filter(|oid| !oid.is_empty() && oid.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStat {
     pub path: String,
     pub added: String,
     pub deleted: String,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
     Unstaged,
     Staged,
@@ -291,7 +527,11 @@ impl Repo {
         }
     }
     fn diff(&self, base: &str, commit: &str, options: &[&str]) -> Result<String> {
-        let mut args = self.diff_args(base, commit)?;
+        let mut args = vec![
+            "-c".to_string(),
+            "diff.suppressBlankEmpty=false".to_string(),
+        ];
+        args.extend(self.diff_args(base, commit)?);
         args.extend(options.iter().map(|s| s.to_string()));
         self.git(&args.iter().map(String::as_str).collect::<Vec<_>>())
     }
@@ -415,8 +655,17 @@ impl Repo {
                 "--no-pager",
                 "-c",
                 "color.ui=false",
+                "-c",
+                "diff.suppressBlankEmpty=false",
                 "diff",
                 "--no-index",
+                "--no-color",
+                "--word-diff=none",
+                "--submodule=short",
+                "--no-relative",
+                "--unified=5",
+                "--inter-hunk-context=0",
+                "--full-index",
                 "--no-ext-diff",
                 "--no-textconv",
                 "--",
@@ -431,7 +680,21 @@ impl Repo {
                 &[0, 1],
             );
         }
-        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-renames"];
+        let mut args = vec![
+            "-c",
+            "diff.suppressBlankEmpty=false",
+            "diff",
+            "--no-color",
+            "--word-diff=none",
+            "--submodule=short",
+            "--no-relative",
+            "--unified=5",
+            "--inter-hunk-context=0",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+        ];
         if file.kind == ChangeKind::Staged {
             args.push("--cached");
         }
@@ -442,9 +705,97 @@ impl Repo {
         self.diff(
             base,
             commit,
-            &["--no-ext-diff", "--no-textconv", "--no-renames", "--", path],
+            &[
+                "--no-color",
+                "--word-diff=none",
+                "--submodule=short",
+                "--no-relative",
+                "--unified=5",
+                "--inter-hunk-context=0",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--",
+                path,
+            ],
         )
     }
+    /// Read a patch without loading either file body into the plugin.
+    pub fn diff_data(&self, base: &str, commit: &str, path: &str) -> Result<crate::host::DiffData> {
+        let patch = self.patch(base, commit, path)?;
+        let content = if is_gitlink(&patch) {
+            ContextSource::Unavailable("Submodule changes have no file context to expand".into())
+        } else {
+            match new_blob(&patch) {
+                Some(oid) if oid.chars().all(|c| c == '0') => ContextSource::Empty,
+                Some(oid) => ContextSource::Blob(oid.to_string()),
+                // A metadata-only patch has no code to expand.
+                None => ContextSource::Empty,
+            }
+        };
+        Ok(crate::host::DiffData {
+            title: format!(
+                "{} · {}",
+                if commit.is_empty() {
+                    format!("{base}…HEAD")
+                } else {
+                    commit[..8.min(commit.len())].to_string()
+                },
+                display_path(path)
+            ),
+            patch,
+            source: Some(DiffSource {
+                repo: self.path.clone(),
+                request: DiffRequest::Comparison {
+                    base: base.into(),
+                    commit: commit.into(),
+                    path: path.into(),
+                },
+                content,
+            }),
+        })
+    }
+
+    pub fn working_diff_data(&self, file: &WorkingFile) -> Result<crate::host::DiffData> {
+        let stamp = if file.kind != ChangeKind::Staged {
+            FileStamp::read(&self.path.join(&file.stat.path))?
+        } else {
+            None
+        };
+        let patch = self.working_patch(file)?;
+        let content = if is_gitlink(&patch) {
+            ContextSource::Unavailable("Submodule changes have no file context to expand".into())
+        } else if file.kind == ChangeKind::Staged {
+            match new_blob(&patch) {
+                Some(oid) if oid.chars().all(|c| c == '0') => ContextSource::Empty,
+                Some(oid) => ContextSource::Blob(oid.into()),
+                None => ContextSource::Empty,
+            }
+        } else {
+            if FileStamp::read(&self.path.join(&file.stat.path))? != stamp {
+                bail!("File changed while reading diff; reopen it to retry");
+            }
+            ContextSource::Worktree {
+                path: file.stat.path.clone(),
+                stamp,
+                blob: new_blob(&patch).map(str::to_string),
+            }
+        };
+        Ok(crate::host::DiffData {
+            title: format!("{} · {}", file.kind.label(), display_path(&file.stat.path)),
+            patch,
+            source: Some(DiffSource {
+                repo: self.path.clone(),
+                request: DiffRequest::Working {
+                    kind: file.kind,
+                    path: file.stat.path.clone(),
+                },
+                content,
+            }),
+        })
+    }
+
     pub fn graph(&self, limit: usize) -> Result<Vec<GraphRow>> {
         if self.optional(&["rev-parse", "--verify", "HEAD"]).is_empty() {
             return Ok(Vec::new());
@@ -853,6 +1204,49 @@ fn parse_numstat(raw: &str) -> Result<Vec<FileStat>> {
         })
         .collect()
 }
+#[cfg(test)]
+mod review_context_tests {
+    use super::*;
+
+    #[test]
+    fn review_context_uses_source_paths_and_escapes_control_characters() {
+        let source = DiffSource {
+            repo: PathBuf::from("/tmp/repo\nname"),
+            request: DiffRequest::Working {
+                kind: ChangeKind::Staged,
+                path: "中文\tfile.rs".into(),
+            },
+            content: ContextSource::Blob("abc123".into()),
+        };
+        assert_eq!(source.review_context(), "Repository: /tmp/repo\\nname\nFile: 中文\\tfile.rs\nComparison: HEAD → index (staged)\nNew-side blob: abc123\n");
+    }
+
+    #[test]
+    fn review_context_distinguishes_branch_and_commit_comparisons() {
+        let mut source = DiffSource {
+            repo: PathBuf::from("/tmp/repo"),
+            request: DiffRequest::Comparison {
+                base: "origin/main".into(),
+                commit: String::new(),
+                path: "file.rs".into(),
+            },
+            content: ContextSource::Empty,
+        };
+        assert!(source
+            .review_context()
+            .contains("origin/main…HEAD (committed branch changes)"));
+        source.request = DiffRequest::Comparison {
+            base: String::new(),
+            commit: "abc123".into(),
+            path: "file.rs".into(),
+        };
+        assert!(source
+            .review_context()
+            .contains("commit abc123 (first-parent change)"));
+        assert!(!source.review_context().contains("origin/main"));
+    }
+}
+
 #[cfg(test)]
 mod graph_color_tests {
     use super::*;

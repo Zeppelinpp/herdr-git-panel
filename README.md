@@ -5,7 +5,8 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 ## Features
 
 - **Branch comparison:** search local and already fetched remote branches by name. The panel never fetches automatically.
-- **Working-tree changes:** browse unstaged, staged and untracked files. Open a file to inspect its diff.
+- **Working-tree changes:** browse unstaged, staged and untracked files. The selected file's diff appears directly below the file lists.
+- **Send selected changes to an agent:** select diff lines and press `p` to choose an available Herdr agent pane in the current workspace.
 - **Committed changes:** see file statistics between the selected comparison branch and the current branch.
 - **Commit history:** browse a colored branch/merge graph. Expand multiple commits independently to inspect their file statistics and diffs. History starts collapsed to leave more room for working-tree changes.
 - **Commit:** enter a title and multiline description. Stage all changes, or commit only files already staged.
@@ -18,14 +19,50 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 | Open / close the panel | `Cmd+Shift+R` after setup |
 | Move focus | `Tab` / `Shift+Tab` |
 | Navigate files and commits | `j` / `k`, `↑` / `↓`, mouse wheel |
-| Expand a commit or open a diff | `Enter` or click |
+| Expand a commit / focus the selected diff | `Enter` |
+| Open the selected diff in a popup | `o` from the file list |
+| Select diff lines / choose an agent target | `v`, then arrows / `p` |
 | Commit | `Ctrl+S` |
 | Push | `Ctrl+P`, configurable |
 | Refresh | `Ctrl+R` |
 | Open the created MR / PR | Click its link, or focus it and press `Enter` |
-| Close a diff, dialog or panel | `Esc` |
+| Return from inline diff / close a dialog or panel | `Esc` |
 
-In a diff popup, use `↑` / `↓` to scroll, `←` / `→` to scroll horizontally, and `PageUp` / `PageDown` for larger steps.
+Selecting a file previews its diff inline. With commit history collapsed, the
+preview fills the space below the compact file lists; expanded history shares
+that space with the preview. Press `Enter` on a file or click the preview to read
+it, and `Esc` to return to the file list. File clicks select without opening a popup.
+
+Diffs show each change with **five unchanged lines before and after**, fixed
+old/new line numbers, and folds for more distant context. Overlapping context
+windows appear once. Use `↑` / `↓` to move, `←` / `→` to pan code horizontally, `PageUp` /
+`PageDown` to move by a viewport, and `[` / `]` to jump between changes.
+On a folded row, `Enter` expands 20 lines next to the change (`t` explicitly expands
+from the beginning, `b` or `Shift+Enter` from the end), and `a` expands the whole
+interval. Click the left/right half of a folded row to expand from the
+beginning/end; Shift-click expands the whole
+interval. Press `Space` on expanded context or its remaining fold to collapse that
+interval again.
+
+Context outside the patch loads in the background only when requested. If a working
+file has changed since the diff opened, expansion asks you to press `r` to refresh.
+Committed and staged context stays pinned to the version shown in the diff.
+Refresh restores the selected source line when it still exists. Inserted/deleted
+lines follow Herdr's theme, with bounded inline emphasis for edited portions of
+paired lines.
+
+In either diff view, press `v` and move with arrows or `j` / `k` to select lines.
+Mouse drag and Shift-click also select a range. Press `p` to choose an idle or done
+agent in the current workspace, then `Enter` or **Send** to paste the selection
+into its input. Review or edit it there and press Enter to submit. The text includes
+the repository, file, comparison, old/new line numbers and complete selected lines.
+Folded intervals are marked as omitted. Escape first cancels the target picker or
+selection, then returns from the inline diff to the file list.
+
+While selecting or choosing a target, the diff snapshot stays stable across file
+updates. Selections are limited to 2,000 source lines and 128 KiB including context
+information. After an unconfirmed delivery, inspect the target's input and press
+`r` in the picker to reload targets before retrying.
 
 ## Installation
 
@@ -46,6 +83,15 @@ herdr plugin update zeppelinpp.git-panel
 ```
 
 Close and reopen an existing panel after updating.
+
+To install a specific published version:
+
+```sh
+herdr plugin install Zeppelinpp/herdr-git-panel --ref v0.7.0
+```
+
+`plugin update` follows the installation's saved source/ref. A version pinned with
+`--ref` stays on that ref; install the new tag explicitly to move to another release.
 
 Add this shortcut to `~/.config/herdr/config.toml`:
 

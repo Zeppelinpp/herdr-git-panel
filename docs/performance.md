@@ -60,6 +60,82 @@ Git command deadlines now include output collection. Each command owns a process
 - The working tree, actual Git directory and shared Git directory are watched, including linked worktrees and standard/embedded submodule metadata. Changes to global Git configuration or external global exclude files require manual refresh.
 - An already running executable continues using its loaded code after rebuilding. Close and reopen the panel to activate this implementation.
 
+## Folded diff viewer
+
+The viewer keeps Git's patch as the source of change boundaries and starts with
+five context lines on either side of each change; more distant intervals fold.
+Overlapping context windows are projected once. Opening a diff reads the patch and its content
+identity; it does not load file bodies into the plugin. Patch context can expand
+immediately. Expanding beyond that context reads the new-side file on a worker,
+which prepares one text buffer, line-start offsets and a cached display width.
+The UI validates patch lines before attaching the prepared content. Committed and
+staged content uses the full blob OID in the patch; worktree content is checked
+against metadata and the patch's new-side hash. Refresh also prepares its document
+on a worker.
+
+Hidden intervals and expanded context are ranges. Even expanding an entire large
+interval does not create a styled object for every line. A compact projection
+maps display positions to code blocks and context ranges by binary search; each
+frame creates spans only for viewport rows. Vertical offsets use `usize`, and
+both axes are clamped using the current viewport. Cursor, keyboard, mouse and
+refresh share source-line mappings in both popup and in-pane modes. Background
+completion wakes the event loop; idle viewing does not poll or redraw.
+
+The main panel previews the selected file inline. A 75ms selection deadline
+coalesces fast navigation before reading Git. One active worker and one replaceable
+desired request bound the queue; old results cannot replace a newer selection.
+The event loop waits for the deadline or worker completion, with no idle timer.
+Working-tree notifications refresh working previews even if statistics match,
+while committed previews retain their snapshot. Same-content refreshes update
+worktree stamps and keep loaded context, folds and reading position.
+
+Review selection adds only range comparisons to viewport rendering. Export runs
+on demand, reads original selected rows (including full text beyond horizontal
+clipping), and stops at 2,000 source rows or 128 KiB. Hidden intervals remain
+explicit omissions. Target discovery and delivery run on background workers and
+wake the UI on completion. Discovery is requested only with `p` or explicit
+refresh, so there is no agent polling while browsing. A selection holds its diff
+snapshot until released; repository refresh reconciliation then resumes.
+
+A real 120×50 PTY check verifies that the initial inline preview appears without
+input, includes exactly five context lines on each side, expands missing content
+after a mouse click, and returns to the file list on Esc. The subsequent 150ms idle
+observation produced zero terminal bytes. In-memory UI tests also cover selection
+changes without popup creation, unchanged statistics after a save, history sharing
+the available height, and windows too short to focus a readable preview.
+
+Inline emphasis compares at most 128 equal-count deletion/insertion pairs in a
+change block, with a 4,096-byte line limit. It marks the differing range between
+equal prefixes and suffixes. Larger or differently shaped replacements keep
+ordinary diff colors. Syntax grammar loading is deferred to future work.
+
+Release-mode measurements on 2026-10-27 used a 120×40 Ratatui `TestBackend`,
+synthetic inserted lines, and 300 downward moves plus draws. These measure model
+construction and in-memory terminal rendering; Git queries, popup startup, theme
+application and terminal I/O are excluded. The first case also incurs warm-up.
+
+| Changed lines | Document build | 300 frames |
+| --- | ---: | ---: |
+| 1,000 | 0.212ms | 60.4ms |
+| 10,000 | 0.608ms | 37.3ms |
+| 100,000 | 4.54ms | 36.2ms |
+
+Reproduce with `cargo test --release --locked diff_viewport_benchmark --lib -- --ignored --nocapture`.
+The measurements show the vertical scroll path stays independent of total changed
+line count for this fixture; they do not establish an end-to-end latency or memory
+limit. A separate real 120×40 PTY smoke check opened a committed diff, expanded
+missing context asynchronously without another keypress, collapsed it, and exited
+cleanly. An idle 150ms observation after expansion produced zero terminal bytes.
+
+Limits: the initial patch remains proportional to changed content. First expansion
+beyond the patch reads and indexes the entire new-side file; the index adds one
+`usize` per line. Worktree hash verification has transient whole-file copies.
+Long-line horizontal clipping still scans characters up to the offset, with no
+per-character string allocation or sparse column index. Custom clean filters that
+cannot be matched by raw/CRLF-normalized content reject expansion. Native Herdr
+pane creation and Linux terminal behavior need verification in their respective
+environments.
+
 ## History module and final review
 
 `history` now owns Git graph rows, multiple expansions, selected SHA/path identity, viewport and cached projection behind one behavioral interface. It returns read-commit/open-file actions and opaque row-hit tokens; the UI never interprets projected indices. Transport rows move into History instead of remaining duplicated in the panel snapshot. Reconciliation is O(rows + expanded commits); j/k only selects cached rows. Missing selected files fall back to their owning commit, while deferred actions reject missing files.

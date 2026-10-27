@@ -197,6 +197,8 @@ impl Theme {
     /// Widget styles use a small set of semantic ANSI roles internally. Resolve
     /// those roles after layout, so every popup/editor uses the same host palette.
     pub fn apply(&self, buffer: &mut Buffer) {
+        let added = diff_background(self.background, self.green);
+        let deleted = diff_background(self.background, self.red);
         for cell in &mut buffer.content {
             let semantic_color = matches!(
                 cell.fg,
@@ -233,9 +235,15 @@ impl Theme {
                 Color::Gray => self.muted,
                 other => other,
             };
-            if cell.bg == Color::Reset {
-                cell.bg = self.background;
-            }
+            // Red/green backgrounds denote a diff wash, while the foreground
+            // keeps the normal semantic color. Terminal-default backgrounds
+            // remain transparent when their RGB value is unknown.
+            cell.bg = match cell.bg {
+                Color::Green => added,
+                Color::Red => deleted,
+                Color::Reset => self.background,
+                other => other,
+            };
             if dim {
                 cell.modifier.remove(Modifier::DIM);
             }
@@ -289,6 +297,15 @@ impl Theme {
                 }
             }
         }
+    }
+}
+fn diff_background(background: Color, tint: Color) -> Color {
+    match (background, tint) {
+        (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) => {
+            let mix = |base: u8, tint: u8| ((u16::from(base) * 9 + u16::from(tint) + 5) / 10) as u8;
+            Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb))
+        }
+        _ => background,
     }
 }
 fn canonical(name: &str) -> String {
@@ -387,6 +404,27 @@ pub fn parse_color(value: &str) -> Option<Color> {
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+    #[test]
+    fn diff_backgrounds_follow_the_host_and_keep_terminal_defaults() {
+        for name in ["catppuccin", "one-light"] {
+            let theme =
+                Theme::from_config(&format!("[theme]\nname='{name}'"), Appearance::Dark).unwrap();
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+            buffer[(0, 0)].set_style(Style::new().fg(Color::Green).bg(Color::Green));
+            buffer[(1, 0)].set_style(Style::new().fg(Color::Red).bg(Color::Red));
+            theme.apply(&mut buffer);
+            assert_ne!(buffer[(0, 0)].bg, theme.background);
+            assert_ne!(buffer[(1, 0)].bg, theme.background);
+            assert_ne!(buffer[(0, 0)].bg, buffer[(1, 0)].bg);
+            assert_eq!(buffer[(0, 0)].fg, theme.green);
+        }
+        let theme = Theme::from_config("[theme]\nname='terminal'", Appearance::Dark).unwrap();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buffer[(0, 0)].set_style(Style::new().fg(Color::Green).bg(Color::Green));
+        theme.apply(&mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert_eq!(buffer[(0, 0)].fg, Color::Green);
+    }
     #[test]
     fn input_cursor_supports_ansi_tokens_and_terminal_default_fallback() {
         let theme = Theme::from_config(
