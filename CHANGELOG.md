@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.1] - 2026-10-28
+
+### Added
+
+- Press Space in the working-tree list to stage or unstage the selected file while preserving its working copy.
+- Press `d` to discard all changes to the selected file, with a file-specific `y`/`n` confirmation and protection against edits made while the dialog is open.
+- Move across file lists, inline diffs, history and other non-editing focus areas with `j`/`k` at row boundaries. Tab remains a direct focus jump; active diff selections stay inside the diff.
+
+### Performance and fixes
+
+- Keep file actions on the serialized background Git worker and refresh only working-tree data afterward. Preserve drafts, cached history and the user's current selection.
+- Preserve path identity for queued file actions and prevent hidden or clipped discard confirmations from accepting destructive input.
+
 ## [0.7.0] - 2026-10-28
 
 ### Features
