@@ -1,6 +1,6 @@
 use crate::{
     diff_view::Viewer,
-    git::{matching_branches, ChangeKind, FileStat, Mr, Repo, Snapshot},
+    git::{matching_branches, ChangeKind, DiscardPlan, FileStat, Mr, Repo, Snapshot},
     history::{Action as HistoryAction, History, Identity as GraphSelection, RowHit},
     host::{self, Config, DiffData},
     preview::{Preview, Request as PreviewRequest, MIN_HEIGHT as MIN_PREVIEW_HEIGHT},
@@ -97,6 +97,7 @@ enum Dialog {
     Mr(MrDialog),
     Push(String, String),
     Diff(Box<Viewer>),
+    Discard(Box<DiscardPlan>),
 }
 enum AutoData {
     Snapshot(Box<Snapshot>),
@@ -111,6 +112,19 @@ enum Update {
     Done,
     Mr(String),
     Diff(DiffData),
+    DiscardReady(Box<DiscardPlan>),
+    FileAction(Box<FileActionResult>),
+}
+enum FileAction {
+    ToggleStage(ChangeKind, String),
+    PrepareDiscard(String),
+    Discard(Box<DiscardPlan>),
+}
+struct FileActionResult {
+    status: String,
+    working: crate::git::WorkingTree,
+    message: String,
+    preferred: Option<(ChangeKind, String)>,
 }
 enum Activation {
     Focus(Focus),
@@ -154,6 +168,9 @@ pub struct Panel {
     refresh_notice: Option<String>,
     pending_refresh: bool,
     pending_activation: Option<Activation>,
+    pending_file_action: Option<FileAction>,
+    discard_visible: bool,
+    file_action_running: bool,
     background_refresh: bool,
     wake: Option<SyncSender<()>>,
     watch_notice: Option<String>,
@@ -289,6 +306,9 @@ impl Panel {
             refresh_notice: None,
             pending_refresh: false,
             pending_activation: None,
+            pending_file_action: None,
+            discard_visible: false,
+            file_action_running: false,
             background_refresh: false,
             wake: None,
             watch_notice: None,
@@ -355,6 +375,7 @@ impl Panel {
         };
         self.dirty |= !matches!(&result, Ok(Update::Automatic(_)));
         self.background_refresh = false;
+        self.file_action_running = false;
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -412,6 +433,42 @@ impl Panel {
                 }
             }
             Ok(Update::Done) => self.message.clear(),
+            Ok(Update::DiscardReady(plan)) => {
+                self.message.clear();
+                self.discard_visible = false;
+                self.dialog = Some(Dialog::Discard(plan));
+            }
+            Ok(Update::FileAction(result)) => {
+                let FileActionResult {
+                    status,
+                    working,
+                    message,
+                    preferred,
+                } = *result;
+                let selected_path = self.working_key().map(|(_, path)| path);
+                self.replace_working(status, working);
+                if let (Some((kind, path)), Some(snapshot)) = (preferred, &self.snapshot) {
+                    let files = &snapshot.working.files;
+                    if selected_path.as_ref() == Some(&path) {
+                        if let Some(index) = files
+                            .iter()
+                            .position(|f| f.kind == kind && f.stat.path == path)
+                            .or_else(|| files.iter().position(|f| f.stat.path == path))
+                        {
+                            self.working_files.select(Some(index));
+                        }
+                    }
+                }
+                self.message = message;
+                if !self.sync_preview() {
+                    self.preview.invalidate(self.wake.clone());
+                }
+            }
+        }
+        if !self.busy() {
+            if let Some(action) = self.pending_file_action.take() {
+                self.run_file_action(action);
+            }
         }
         if !self.busy() {
             if let Some(action) = self.pending_activation.take() {
@@ -485,6 +542,63 @@ impl Panel {
             .files
             .get(self.working_files.selected()?)
             .map(|file| (file.kind, file.stat.path.clone()))
+    }
+
+    fn run_file_action(&mut self, action: FileAction) {
+        if self.busy() {
+            if self.pending_file_action.is_none()
+                && (self.background_refresh || matches!(action, FileAction::Discard(_)))
+            {
+                self.pending_file_action = Some(action);
+                self.pending_activation = None;
+            }
+            return;
+        }
+        let repo = self.repo.clone();
+        let label = match &action {
+            FileAction::ToggleStage(ChangeKind::Staged, _) => "Unstaging file…",
+            FileAction::ToggleStage(_, _) => "Staging file…",
+            FileAction::PrepareDiscard(_) => "Checking file changes…",
+            FileAction::Discard(_) => "Discarding file changes…",
+        };
+        self.file_action_running = true;
+        self.work(label, move || {
+            let (outcome, preferred, success) = match action {
+                FileAction::PrepareDiscard(path) => {
+                    return Ok(Update::DiscardReady(Box::new(repo.prepare_discard(&path)?)))
+                }
+                FileAction::ToggleStage(kind, path) => {
+                    let result = repo.toggle_stage(kind, &path);
+                    let next = if kind == ChangeKind::Staged {
+                        ChangeKind::Unstaged
+                    } else {
+                        ChangeKind::Staged
+                    };
+                    (
+                        result,
+                        Some((next, path)),
+                        if next == ChangeKind::Staged {
+                            "File staged"
+                        } else {
+                            "File unstaged"
+                        },
+                    )
+                }
+                FileAction::Discard(plan) => (repo.discard(&plan), None, "File changes discarded"),
+            };
+            let message = outcome
+                .map(|_| success.to_string())
+                .unwrap_or_else(|error| format!("{error:#}"));
+            let (status, working) = repo.worktree_snapshot().map_err(|error| {
+                anyhow::anyhow!("{message}; refresh failed: {error:#}. Press Ctrl+R to refresh")
+            })?;
+            Ok(Update::FileAction(Box::new(FileActionResult {
+                status,
+                working,
+                message,
+                preferred,
+            })))
+        });
     }
 
     fn sync_preview(&mut self) -> bool {
@@ -605,7 +719,11 @@ impl Panel {
         }
     }
     fn can_focus(&self, focus: Focus) -> bool {
-        if self.busy() && !self.background_refresh && focus != Focus::Diff {
+        if self.busy()
+            && !self.background_refresh
+            && !self.file_action_running
+            && focus != Focus::Diff
+        {
             return false;
         }
         match focus {
@@ -829,7 +947,9 @@ impl Panel {
     }
     fn navigate(&mut self, delta: isize) {
         match self.focus {
-            Focus::Graph => self.history.navigate(delta),
+            Focus::Graph => {
+                self.history.navigate(delta);
+            }
             Focus::WorkingFiles => move_list(
                 &mut self.working_files,
                 self.snapshot.as_ref().map_or(0, |s| s.working.files.len()),
@@ -848,6 +968,98 @@ impl Panel {
         ) {
             self.preview_origin = self.focus;
             self.sync_preview();
+        }
+    }
+
+    fn jump_navigation_focus(&mut self, forward: bool) {
+        let Some(current) = FOCI.iter().position(|focus| *focus == self.focus) else {
+            return;
+        };
+        for distance in 1..FOCI.len() {
+            let index = if forward {
+                current
+                    .checked_add(distance)
+                    .filter(|index| *index < FOCI.len())
+            } else {
+                current.checked_sub(distance)
+            };
+            let Some(index) = index else {
+                break;
+            };
+            let focus = FOCI[index];
+            if matches!(focus, Focus::Title | Focus::Description) || !self.can_focus(focus) {
+                continue;
+            }
+            self.focus = focus;
+            match focus {
+                Focus::WorkingFiles => {
+                    let count = self.snapshot.as_ref().map_or(0, |s| s.working.files.len());
+                    self.working_files.select(Some(if forward {
+                        0
+                    } else {
+                        count.saturating_sub(1)
+                    }));
+                }
+                Focus::BranchFiles => {
+                    let count = self.snapshot.as_ref().map_or(0, |s| s.files.len());
+                    self.branch_files.select(Some(if forward {
+                        0
+                    } else {
+                        count.saturating_sub(1)
+                    }));
+                }
+                Focus::Graph => {
+                    self.history
+                        .navigate(if forward { isize::MIN } else { isize::MAX });
+                }
+                Focus::Diff => self.preview.enter_navigation_edge(forward),
+                _ => (),
+            }
+            if matches!(
+                focus,
+                Focus::WorkingFiles | Focus::BranchFiles | Focus::Graph
+            ) {
+                self.preview_origin = focus;
+                self.sync_preview();
+            }
+            break;
+        }
+    }
+
+    fn navigate_across(&mut self, delta: isize) {
+        let forward = delta > 0;
+        let (selected, count) = match self.focus {
+            Focus::WorkingFiles => (
+                self.working_files.selected(),
+                self.snapshot.as_ref().map_or(0, |s| s.working.files.len()),
+            ),
+            Focus::BranchFiles => (
+                self.branch_files.selected(),
+                self.snapshot.as_ref().map_or(0, |s| s.files.len()),
+            ),
+            Focus::Graph => {
+                let moved = self.history.navigate(delta);
+                self.preview_origin = Focus::Graph;
+                self.sync_preview();
+                if !moved {
+                    self.jump_navigation_focus(forward);
+                }
+                return;
+            }
+            _ => {
+                self.jump_navigation_focus(forward);
+                return;
+            }
+        };
+        let at_edge = if forward {
+            selected.unwrap_or(0) >= count.saturating_sub(1)
+        } else {
+            selected.unwrap_or(0) == 0
+        };
+        if at_edge {
+            self.jump_navigation_focus(forward);
+        } else {
+            self.navigate(delta);
         }
     }
     pub fn key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -897,13 +1109,35 @@ impl Panel {
             return Ok(false);
         }
         if self.focus == Focus::Diff {
-            if self.preview.key(key) {
+            let forward = match key.code {
+                KeyCode::Char('j') | KeyCode::Down => Some(true),
+                KeyCode::Char('k') | KeyCode::Up => Some(false),
+                _ => None,
+            };
+            if forward.is_some_and(|forward| self.preview.at_navigation_edge(forward)) {
+                self.jump_navigation_focus(forward.unwrap());
+            } else if self.preview.key(key) {
                 self.leave_preview();
             }
             return Ok(false);
         }
-        if self.busy() && !self.background_refresh {
+        if self.busy() && !self.background_refresh && !self.file_action_running {
             return Ok(false);
+        }
+        if self.focus == Focus::WorkingFiles && key.modifiers.is_empty() {
+            if let Some((kind, path)) = self.working_key() {
+                match key.code {
+                    KeyCode::Char(' ') => {
+                        self.run_file_action(FileAction::ToggleStage(kind, path));
+                        return Ok(false);
+                    }
+                    KeyCode::Char('d') => {
+                        self.run_file_action(FileAction::PrepareDiscard(path));
+                        return Ok(false);
+                    }
+                    _ => (),
+                }
+            }
         }
         if key.code == KeyCode::Char('o')
             && matches!(
@@ -934,8 +1168,8 @@ impl Panel {
             }
             _ => match key.code {
                 KeyCode::Enter | KeyCode::Char(' ') => self.activate()?,
-                KeyCode::Down | KeyCode::Char('j') => self.navigate(1),
-                KeyCode::Up | KeyCode::Char('k') => self.navigate(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.navigate_across(1),
+                KeyCode::Up | KeyCode::Char('k') => self.navigate_across(-1),
                 KeyCode::PageDown => self.navigate(8),
                 KeyCode::PageUp => self.navigate(-8),
                 _ => (),
@@ -1002,6 +1236,17 @@ impl Panel {
                     return Ok(true);
                 }
             }
+            Dialog::Discard(plan) => match key.code {
+                KeyCode::Char('y' | 'Y')
+                    if self.discard_visible
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+                {
+                    self.run_file_action(FileAction::Discard(plan.clone()));
+                    return Ok(true);
+                }
+                KeyCode::Char('n' | 'N') => return Ok(true),
+                _ => (),
+            },
         }
         Ok(false)
     }
@@ -1116,13 +1361,17 @@ impl Panel {
                     });
                     close = true;
                 }
+                (Dialog::Discard(plan), Hit::Submit) if self.discard_visible => {
+                    self.run_file_action(FileAction::Discard(plan.clone()));
+                    close = true;
+                }
                 (_, Hit::Cancel) => close = true,
                 _ => (),
             }
             if !close {
                 self.dialog = Some(dialog);
             }
-        } else if !self.busy() || self.background_refresh {
+        } else if !self.busy() || self.background_refresh || self.file_action_running {
             match hit {
                 Hit::Focus(focus) => {
                     if !self.can_focus(focus) {
@@ -1238,6 +1487,7 @@ impl Panel {
         Ok(false)
     }
     pub fn render(&mut self, frame: &mut Frame) {
+        self.discard_visible = false;
         if !self.can_focus(self.focus) {
             self.change_focus(false);
         }
@@ -1426,14 +1676,15 @@ impl Panel {
             outer[6],
         );
         self.render_history(frame, outer[7]);
-        footer(
-            frame,
-            outer[8],
-            &format!(
-                "Tab focus  Enter diff  o popup  ^R refresh  {} push  Esc close",
+        let hint = if self.focus == Focus::WorkingFiles {
+            "Space stage/unstage  d discard  j/k move  Tab jump  Enter diff".to_string()
+        } else {
+            format!(
+                "j/k move  Tab jump  Enter activate  ^R refresh  {} push  Esc close",
                 self.cfg.push_key
-            ),
-        );
+            )
+        };
+        footer(frame, outer[8], &hint);
         if let Some(mut dialog) = self.dialog.take() {
             self.render_dialog(frame, &mut dialog);
             self.dialog = Some(dialog);
@@ -1786,6 +2037,65 @@ impl Panel {
                 let area = dialog_area(frame.area(), frame.area().width, frame.area().height);
                 frame.render_widget(Clear, area);
                 viewer.render(frame, area);
+            }
+            Dialog::Discard(plan) => {
+                let bounds = dialog_area(frame.area(), 80, frame.area().height.saturating_sub(2));
+                let width = usize::from(bounds.width.saturating_sub(2)).max(1);
+                let effect = if plan.deletes_file {
+                    "Delete this newly added file:"
+                } else {
+                    "Reset staged and unstaged changes to HEAD:"
+                };
+                let content = format!("{effect}\n\n{}", visible(&plan.path));
+                let mut lines = Vec::new();
+                let mut text = String::new();
+                let mut columns = 0;
+                for ch in content.chars() {
+                    let cells = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if ch == '\n' || columns + cells > width {
+                        lines.push(Line::raw(std::mem::take(&mut text)));
+                        columns = 0;
+                        if ch == '\n' {
+                            continue;
+                        }
+                    }
+                    text.push(ch);
+                    columns += cells;
+                }
+                lines.push(Line::raw(text));
+                let height = u16::try_from(lines.len())
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(4);
+                let area = dialog_area(frame.area(), 80, height.min(bounds.height));
+                let block = Block::bordered().title("Discard file changes?");
+                let inner = block.inner(area);
+                frame.render_widget(Clear, area);
+                frame.render_widget(block, area);
+                let rows =
+                    Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+                self.discard_visible = lines.len() <= usize::from(rows[0].height);
+                frame.render_widget(Paragraph::new(lines), rows[0]);
+                let hint = if self.discard_visible {
+                    "[y Discard]   [n Cancel]"
+                } else {
+                    "n Cancel · enlarge to confirm"
+                };
+                frame.render_widget(Paragraph::new(hint).style(BOLD), rows[1]);
+                if self.discard_visible {
+                    self.hits.push((
+                        Rect::new(rows[1].x, rows[1].y, rows[1].width.min(11), rows[1].height),
+                        Hit::Submit,
+                    ));
+                    self.hits.push((
+                        Rect::new(
+                            rows[1].x.saturating_add(14),
+                            rows[1].y,
+                            rows[1].width.saturating_sub(14),
+                            rows[1].height,
+                        ),
+                        Hit::Cancel,
+                    ));
+                }
             }
         }
     }
@@ -2791,6 +3101,190 @@ mod tests {
             .unwrap();
         panel.receive();
         (root, panel)
+    }
+
+    fn finish_file_action(panel: &mut Panel, terminal: &mut Terminal<TestBackend>) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            panel.receive();
+            panel.draw_pending(terminal).unwrap();
+            if !panel.busy() && panel.pending_file_action.is_none() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "file action did not complete");
+            thread::sleep(std::time::Duration::from_millis(3));
+        }
+    }
+
+    #[test]
+    fn space_stages_and_unstages_the_selected_file_without_losing_focus_or_drafts() {
+        let (root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        panel.focus = Focus::WorkingFiles;
+        panel.title.insert_str("Keep draft");
+        panel.key(KeyEvent::from(KeyCode::Char(' '))).unwrap();
+        panel.draw_pending(&mut terminal).unwrap();
+        assert_eq!(panel.focus, Focus::WorkingFiles);
+        finish_file_action(&mut panel, &mut terminal);
+        assert_eq!(
+            panel.working_key(),
+            Some((ChangeKind::Staged, "a.txt".into()))
+        );
+        panel.key(KeyEvent::from(KeyCode::Char(' '))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        assert_eq!(
+            panel.working_key(),
+            Some((ChangeKind::Untracked, "a.txt".into()))
+        );
+        assert_eq!(panel.focus, Focus::WorkingFiles);
+        assert_eq!(text(&panel.title), "Keep draft");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "FIRST_INLINE_CONTENT\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
+            "SECOND_INLINE_CONTENT\n"
+        );
+    }
+
+    #[test]
+    fn discard_requires_y_and_n_cancels_without_mutating_the_file() {
+        let (root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        panel.focus = Focus::WorkingFiles;
+        panel.key(KeyEvent::from(KeyCode::Char('d'))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        assert!(matches!(panel.dialog, Some(Dialog::Discard(_))));
+        panel.key(KeyEvent::from(KeyCode::Char('n'))).unwrap();
+        assert!(panel.dialog.is_none());
+        assert!(root.path().join("a.txt").exists());
+        panel.key(KeyEvent::from(KeyCode::Char('d'))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        panel.key(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(matches!(panel.dialog, Some(Dialog::Discard(_))));
+        assert!(root.path().join("a.txt").exists());
+        panel.key(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        assert!(!root.path().join("a.txt").exists());
+        assert!(root.path().join("b.txt").exists());
+        assert_eq!(
+            panel.working_key(),
+            Some((ChangeKind::Untracked, "b.txt".into()))
+        );
+    }
+
+    #[test]
+    fn hidden_or_stale_discard_confirmation_cannot_remove_new_edits() {
+        let (root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        panel.focus = Focus::WorkingFiles;
+        panel.key(KeyEvent::from(KeyCode::Char('d'))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        terminal.backend_mut().resize(25, 18);
+        terminal.draw(|f| panel.render(f)).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        assert!(matches!(panel.dialog, Some(Dialog::Discard(_))));
+        assert!(root.path().join("a.txt").exists());
+        terminal.backend_mut().resize(100, 45);
+        terminal.draw(|f| panel.render(f)).unwrap();
+        std::fs::write(root.path().join("a.txt"), "Edited after confirmation\n").unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        assert!(panel.message.contains("changed since confirmation"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "Edited after confirmation\n"
+        );
+    }
+
+    #[test]
+    fn a_queued_file_action_keeps_its_path_when_navigation_changes_selection() {
+        let (root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        panel.focus = Focus::WorkingFiles;
+        panel.worker = Some(thread::spawn(|| ()));
+        panel.background_refresh = true;
+        panel.key(KeyEvent::from(KeyCode::Char(' '))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        assert_eq!(panel.working_key().unwrap().1, "b.txt");
+        panel.sender.send(Ok(Update::Automatic(None))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        assert_eq!(
+            panel.working_key(),
+            Some((ChangeKind::Untracked, "b.txt".into()))
+        );
+        let staged = panel
+            .repo
+            .git(&["diff", "--cached", "--name-only"])
+            .unwrap();
+        assert_eq!(staged.trim(), "a.txt");
+        assert!(root.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn repeated_file_actions_cannot_replace_an_inflight_discard_confirmation() {
+        let (root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        let plan = panel.repo.prepare_discard("a.txt").unwrap();
+        panel.focus = Focus::WorkingFiles;
+        panel.worker = Some(thread::spawn(|| ()));
+        panel.file_action_running = true;
+        panel.key(KeyEvent::from(KeyCode::Char('d'))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('d'))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char(' '))).unwrap();
+        assert!(panel.pending_file_action.is_none());
+        panel
+            .sender
+            .send(Ok(Update::DiscardReady(Box::new(plan))))
+            .unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        assert!(matches!(&panel.dialog, Some(Dialog::Discard(plan)) if plan.path == "a.txt"));
+        panel.key(KeyEvent::from(KeyCode::Char('y'))).unwrap();
+        finish_file_action(&mut panel, &mut terminal);
+        assert!(!root.path().join("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
+            "SECOND_INLINE_CONTENT\n"
+        );
+    }
+
+    #[test]
+    fn jk_crosses_list_diff_and_history_boundaries_while_tab_jumps_sections() {
+        let (_root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        panel.snapshot.as_mut().unwrap().files = vec![FileStat {
+            path: "base.txt".into(),
+            added: "1".into(),
+            deleted: "0".into(),
+        }];
+        panel.focus = Focus::WorkingFiles;
+        panel.working_files.select(Some(1));
+        panel.key(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        assert_eq!(panel.focus, Focus::BranchFiles);
+        assert_eq!(panel.branch_files.selected(), Some(0));
+        panel.key(KeyEvent::from(KeyCode::Char('k'))).unwrap();
+        assert_eq!(panel.focus, Focus::WorkingFiles);
+        assert_eq!(panel.working_files.selected(), Some(1));
+        panel.key(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        assert_eq!(panel.focus, Focus::Diff);
+        panel.key(KeyEvent::from(KeyCode::Char('k'))).unwrap();
+        assert_eq!(panel.focus, Focus::BranchFiles);
+        panel.key(KeyEvent::from(KeyCode::Tab)).unwrap();
+        assert_eq!(panel.focus, Focus::Diff);
+        panel.key(KeyEvent::from(KeyCode::Tab)).unwrap();
+        assert_eq!(panel.focus, Focus::HistoryToggle);
+        panel.toggle_history();
+        panel.key(KeyEvent::from(KeyCode::Char('k'))).unwrap();
+        assert_eq!(panel.focus, Focus::HistoryToggle);
+        panel.focus = Focus::Title;
+        panel.key(KeyEvent::from(KeyCode::Char('j'))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('k'))).unwrap();
+        assert_eq!(text(&panel.title), "jk");
     }
 
     fn inline_screen(terminal: &Terminal<TestBackend>) -> String {

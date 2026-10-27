@@ -100,6 +100,33 @@ impl Viewer {
         self.selection.is_some() || self.delivery.is_some() || self.drag_start.is_some()
     }
 
+    /// Embedded navigation may leave the diff only after reaching a boundary.
+    /// A review keeps its cursor and selected snapshot inside this document.
+    pub(crate) fn at_navigation_edge(&self, forward: bool) -> bool {
+        !self.review_active()
+            && (self.doc.is_empty()
+                || if forward {
+                    self.cursor >= self.doc.len().saturating_sub(1)
+                } else {
+                    self.cursor == 0
+                })
+    }
+
+    pub(crate) fn enter_navigation_edge(&mut self, forward: bool) {
+        if self.review_active() {
+            return;
+        }
+        self.cursor = if forward {
+            0
+        } else {
+            self.doc.len().saturating_sub(1)
+        };
+        if forward {
+            self.top = 0;
+        }
+        self.clamp();
+    }
+
     pub(crate) fn captures_input(&self) -> bool {
         self.delivery.is_some()
     }
@@ -573,6 +600,61 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
     use std::time::Instant;
+
+    #[test]
+    fn navigation_edges_follow_document_bounds_and_hold_an_active_review() {
+        let mut viewer = fixture();
+        assert!(viewer.at_navigation_edge(false));
+        assert!(!viewer.at_navigation_edge(true));
+
+        viewer.cursor = 1;
+        assert!(!viewer.at_navigation_edge(false));
+        assert!(!viewer.at_navigation_edge(true));
+
+        viewer.cursor = viewer.doc.len() - 1;
+        assert!(viewer.at_navigation_edge(true));
+        assert!(!viewer.at_navigation_edge(false));
+        viewer.key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(!viewer.at_navigation_edge(true));
+        assert!(!viewer.at_navigation_edge(false));
+        viewer.key(KeyEvent::from(KeyCode::Esc));
+        assert!(viewer.at_navigation_edge(true));
+
+        viewer.drag_start = Some(viewer.cursor);
+        assert!(!viewer.at_navigation_edge(true));
+        viewer.drag_start = None;
+        assert!(viewer.at_navigation_edge(true));
+    }
+
+    #[test]
+    fn empty_diff_is_a_navigation_edge_in_either_direction() {
+        let viewer = Viewer::new(data(String::new()), None);
+        assert!(viewer.at_navigation_edge(false));
+        assert!(viewer.at_navigation_edge(true));
+    }
+
+    #[test]
+    fn entering_a_diff_uses_the_near_edge_and_preserves_an_active_selection() {
+        let mut viewer = fixture();
+        viewer.body = Rect::new(0, 0, 100, 5);
+        viewer.cursor = 3;
+        viewer.top = 1;
+        viewer.enter_navigation_edge(true);
+        assert_eq!((viewer.cursor, viewer.top), (0, 0));
+        viewer.enter_navigation_edge(false);
+        assert_eq!(viewer.cursor, viewer.doc.len() - 1);
+        assert_eq!(
+            viewer.top + usize::from(viewer.body.height),
+            viewer.doc.len()
+        );
+
+        viewer.key(KeyEvent::from(KeyCode::Char('v')));
+        let cursor = viewer.cursor;
+        let anchor = viewer.selection;
+        viewer.enter_navigation_edge(true);
+        assert_eq!(viewer.cursor, cursor);
+        assert_eq!(viewer.selection, anchor);
+    }
 
     fn data(patch: String) -> DiffData {
         DiffData {

@@ -17,8 +17,11 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 | Action | Shortcut |
 | --- | --- |
 | Open / close the panel | `Cmd+Shift+R` after setup |
-| Move focus | `Tab` / `Shift+Tab` |
-| Navigate files and commits | `j` / `k`, `↑` / `↓`, mouse wheel |
+| Jump between focus areas | `Tab` / `Shift+Tab` |
+| Navigate rows and cross section boundaries | `j` / `k`, `↑` / `↓` |
+| Scroll within the hovered list | Mouse wheel |
+| Stage / unstage the selected changed file | `Space` |
+| Discard all changes to the selected changed file | `d`, then `y` to confirm or `n` to cancel |
 | Expand a commit / focus the selected diff | `Enter` |
 | Open the selected diff in a popup | `o` from the file list |
 | Select diff lines / choose an agent target | `v`, then arrows / `p` |
@@ -27,6 +30,18 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 | Refresh | `Ctrl+R` |
 | Open the created MR / PR | Click its link, or focus it and press `Enter` |
 | Return from inline diff / close a dialog or panel | `Esc` |
+
+In the working-tree file list, `Space` stages an unstaged or untracked file and
+unstages a staged file while keeping its working copy. To commit only staged files,
+clear **Stage all changes** in the commit form. `d` opens a file-specific confirmation:
+`y` discards both staged and unstaged changes to HEAD, or deletes a newly added
+file; `n` or `Esc` cancels. Files changed after confirmation opens require a fresh
+confirmation. Directory and submodule discards use their own Git workflow.
+
+Outside text inputs, `j` / `k` move through rows and continue into the adjacent
+focus area at a boundary. Entering a list or diff from above selects its first row;
+entering from below selects its last. Tab jumps directly between areas while
+retaining their positions. Active diff selections keep navigation inside the diff.
 
 Selecting a file previews its diff inline. With commit history collapsed, the
 preview fills the space below the compact file lists; expanded history shares
@@ -87,7 +102,7 @@ Close and reopen an existing panel after updating.
 To install a specific published version:
 
 ```sh
-herdr plugin install Zeppelinpp/herdr-git-panel --ref v0.7.0
+herdr plugin install Zeppelinpp/herdr-git-panel --ref v0.7.1
 ```
 
 `plugin update` follows the installation's saved source/ref. A version pinned with

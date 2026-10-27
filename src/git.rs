@@ -16,6 +16,17 @@ use wait_timeout::ChildExt;
 pub struct Repo {
     pub path: PathBuf,
 }
+
+/// The file identity shown in a discard confirmation, without reading its body.
+#[derive(Clone, Debug)]
+pub struct DiscardPlan {
+    pub path: String,
+    pub deletes_file: bool,
+    repo: PathBuf,
+    head: Option<String>,
+    index: String,
+    stamp: Option<FileStamp>,
+}
 /// A refreshable diff request and the immutable new-side content it describes.
 /// Worktree content is read only on expansion, guarded by a metadata stamp.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +659,141 @@ impl Repo {
             format!("Working tree · {paths} paths  +{additions} -{deletions}")
         };
         Ok(WorkingTree { files, summary })
+    }
+
+    fn file_action_path(&self, path: &str) -> Result<PathBuf> {
+        use std::path::Component;
+        let relative = Path::new(path);
+        if path.is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!("Select a repository file before changing it");
+        }
+        let absolute = self.path.join(relative);
+        let mut ancestor = absolute.parent();
+        while let Some(directory) = ancestor.filter(|directory| *directory != self.path) {
+            match fs::symlink_metadata(directory) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!("File path traverses a symlink directory; refresh before retrying");
+                }
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+            ancestor = directory.parent();
+        }
+        if fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_dir()) {
+            bail!("Directory and submodule actions must be performed outside this file list");
+        }
+        Ok(absolute)
+    }
+
+    fn file_action_head(&self) -> Result<Option<String>> {
+        let args = ["--no-pager", "rev-parse", "--verify", "--quiet", "HEAD"];
+        let head = command_accept(
+            "git",
+            &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            &self.path,
+            120,
+            &[0, 1],
+        )?;
+        Ok((!head.trim().is_empty()).then(|| head.trim().to_string()))
+    }
+
+    fn changed_file(&self, path: &str) -> Result<()> {
+        let status = self.git(&[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--",
+            path,
+        ])?;
+        if !status.split('\0').any(|entry| entry.get(3..) == Some(path)) {
+            bail!("The selected file has no remaining changes; refresh the file list");
+        }
+        Ok(())
+    }
+
+    /// Toggle only the selected row's index state, preserving the worktree.
+    pub fn toggle_stage(&self, kind: ChangeKind, path: &str) -> Result<()> {
+        self.file_action_path(path)?;
+        self.changed_file(path)?;
+        if kind == ChangeKind::Staged {
+            if let Some(head) = self.file_action_head()? {
+                self.git(&["restore", "--staged", "--source", &head, "--", path])?;
+            } else {
+                self.git(&["rm", "--cached", "--force", "--", path])?;
+            }
+        } else {
+            self.git(&["add", "-A", "--", path])?;
+        }
+        Ok(())
+    }
+
+    pub fn prepare_discard(&self, path: &str) -> Result<DiscardPlan> {
+        let absolute = self.file_action_path(path)?;
+        let stamp = FileStamp::read(&absolute)?;
+        self.changed_file(path)?;
+        let head = self.file_action_head()?;
+        let index = self.git(&["ls-files", "--stage", "-z", "--", path])?;
+        let tree = match &head {
+            Some(head) => self.git(&["ls-tree", "-z", head, "--", path])?,
+            None => String::new(),
+        };
+        if [&index, &tree].into_iter().any(|entries| {
+            entries
+                .split('\0')
+                .any(|entry| entry.starts_with("160000 "))
+        }) {
+            bail!("Discard submodule changes in the submodule itself");
+        }
+        if FileStamp::read(&absolute)? != stamp {
+            bail!("File changed while preparing discard; retry to review the current file");
+        }
+        Ok(DiscardPlan {
+            path: path.to_string(),
+            deletes_file: tree.is_empty(),
+            repo: self.path.clone(),
+            head,
+            index,
+            stamp,
+        })
+    }
+
+    /// Discard the confirmed file's entire staged and unstaged change. Each
+    /// identity is rechecked before mutation so an old dialog cannot wipe edits
+    /// made while the user was deciding.
+    pub fn discard(&self, plan: &DiscardPlan) -> Result<()> {
+        if self.path != plan.repo {
+            bail!("Discard confirmation belongs to another repository");
+        }
+        let absolute = self.file_action_path(&plan.path)?;
+        if self.file_action_head()? != plan.head
+            || self.git(&["ls-files", "--stage", "-z", "--", &plan.path])? != plan.index
+            || FileStamp::read(&absolute)? != plan.stamp
+        {
+            bail!("File or repository changed since confirmation opened; retry discard to review the current changes");
+        }
+        if !plan.deletes_file {
+            self.git(&[
+                "restore",
+                "--source",
+                plan.head.as_deref().context("Discard source is missing")?,
+                "--staged",
+                "--worktree",
+                "--",
+                &plan.path,
+            ])?;
+        } else if !plan.index.is_empty() {
+            self.git(&["rm", "--force", "--", &plan.path])?;
+        } else if plan.stamp.is_some() {
+            fs::remove_file(&absolute).with_context(|| format!("Remove {}", absolute.display()))?;
+        }
+        Ok(())
     }
     pub fn working_patch(&self, file: &WorkingFile) -> Result<String> {
         if file.kind == ChangeKind::Untracked {

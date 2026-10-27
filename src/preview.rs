@@ -61,6 +61,7 @@ pub(crate) struct Preview {
     deadline: Option<Instant>,
     running: Option<Running>,
     viewer: Option<Viewer>,
+    pending_navigation_edge: Option<bool>,
     error: Option<String>,
     wake: Option<SyncSender<()>>,
 }
@@ -75,6 +76,7 @@ impl Preview {
             deadline: None,
             running: None,
             viewer: None,
+            pending_navigation_edge: None,
             error: None,
             wake: None,
         }
@@ -92,6 +94,7 @@ impl Preview {
         self.desired = request;
         self.revision = self.revision.wrapping_add(1);
         self.viewer = None;
+        self.pending_navigation_edge = None;
         self.error = None;
         self.deadline = self
             .desired
@@ -180,6 +183,11 @@ impl Preview {
                     } else {
                         self.viewer = Some(viewer);
                     }
+                    if let Some(forward) = self.pending_navigation_edge.take() {
+                        if let Some(viewer) = &mut self.viewer {
+                            viewer.enter_navigation_edge(forward);
+                        }
+                    }
                     self.error = None;
                 }
                 Err(error) => self.error = Some(format!("{error:#}")),
@@ -192,6 +200,20 @@ impl Preview {
 
     pub(crate) fn available(&self) -> bool {
         self.desired.is_some()
+    }
+
+    pub(crate) fn at_navigation_edge(&self, forward: bool) -> bool {
+        self.viewer
+            .as_ref()
+            .is_none_or(|viewer| viewer.at_navigation_edge(forward))
+    }
+
+    pub(crate) fn enter_navigation_edge(&mut self, forward: bool) {
+        if let Some(viewer) = &mut self.viewer {
+            viewer.enter_navigation_edge(forward);
+        } else if self.desired.is_some() {
+            self.pending_navigation_edge = Some(forward);
+        }
     }
 
     /// `true` asks the panel to return focus to its selected file.
@@ -309,6 +331,54 @@ mod tests {
         process::Command,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn preview_navigation_can_pass_loading_content_and_respects_review_boundaries() {
+        let mut preview = Preview::new(Repo {
+            path: std::env::temp_dir(),
+        });
+        assert!(preview.at_navigation_edge(false));
+        assert!(preview.at_navigation_edge(true));
+
+        preview.viewer = Some(fake_viewer("change"));
+        assert!(preview.at_navigation_edge(false));
+        assert!(!preview.at_navigation_edge(true));
+        preview.key(KeyEvent::from(KeyCode::End));
+        assert!(preview.at_navigation_edge(true));
+        preview.key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(!preview.at_navigation_edge(true));
+        assert!(!preview.at_navigation_edge(false));
+        preview.key(KeyEvent::from(KeyCode::Esc));
+        assert!(preview.at_navigation_edge(true));
+    }
+
+    #[test]
+    fn navigation_entry_waits_for_the_selected_document_and_resets_on_selection_change() {
+        let mut preview = Preview::new(Repo {
+            path: std::env::temp_dir(),
+        });
+        preview.desired = Some(request("a"));
+        preview.revision = 1;
+        let (sender, result) = mpsc::channel();
+        preview.running = Some(Running {
+            revision: 1,
+            result,
+        });
+        preview.enter_navigation_edge(false);
+        assert_eq!(preview.pending_navigation_edge, Some(false));
+        sender.send(Ok(fake_viewer("ready"))).ok().unwrap();
+        preview.poll();
+        assert!(preview.at_navigation_edge(true));
+        assert!(preview.pending_navigation_edge.is_none());
+        preview.enter_navigation_edge(true);
+        assert!(preview.at_navigation_edge(false));
+
+        preview.select(Some(request("b")), None);
+        preview.enter_navigation_edge(false);
+        assert_eq!(preview.pending_navigation_edge, Some(false));
+        preview.select(Some(request("c")), None);
+        assert!(preview.pending_navigation_edge.is_none());
+    }
 
     fn git(path: &Path, args: &[&str]) {
         let output = Command::new("git")

@@ -141,3 +141,21 @@ environments.
 `history` now owns Git graph rows, multiple expansions, selected SHA/path identity, viewport and cached projection behind one behavioral interface. It returns read-commit/open-file actions and opaque row-hit tokens; the UI never interprets projected indices. Transport rows move into History instead of remaining duplicated in the panel snapshot. Reconciliation is O(rows + expanded commits); j/k only selects cached rows. Missing selected files fall back to their owning commit, while deferred actions reject missing files.
 
 The query and small-fixture measurements above preceded this final History extraction and review fixes. The additional 3,000-record TUI measurement below uses the final executable. See [quality review](quality-review.md) for reviewed scope, resolved findings and validation limits. The visual architecture review lives in the OS temporary directory, outside the repository.
+
+## File actions and keyboard boundaries
+
+Stage/unstage/discard runs on the existing serialized Git worker. A successful or
+failed mutation reads only the working-tree snapshot, retaining history projections
+and commit drafts. File actions queued behind a repository refresh keep the selected
+path identity, and completing an action does not pull selection away from a file
+the user navigated to meanwhile. Native file notifications continue to coalesce.
+
+Discard preparation reads only the selected path's status, index entries, HEAD
+identity and metadata stamp. Confirmation revalidates those identities before a
+path-scoped restore or removal; it does not load the file body just to show a
+prompt. A hidden or clipped confirmation cannot accept `y`.
+
+Keyboard boundary traversal scans a fixed set of focus areas, while list and diff
+navigation reuse cached projections. History returns whether navigation moved,
+which avoids an extra identity clone or projection merely to detect an edge.
+Mouse-wheel scrolling stays within its hovered region; Tab retains direct jumps.

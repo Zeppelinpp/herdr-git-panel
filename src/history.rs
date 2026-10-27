@@ -154,20 +154,21 @@ impl History {
             self.state.select(Some(index));
         }
     }
-    pub(crate) fn navigate(&mut self, delta: isize) {
+    pub(crate) fn navigate(&mut self, delta: isize) -> bool {
         if self.folded {
-            return;
+            return false;
         }
         self.prepare(self.projection.width);
         let indices = &self.projection.selectable;
         if indices.is_empty() {
-            return;
+            return false;
         }
         let position = indices
             .binary_search(&self.state.selected().unwrap_or(0))
             .unwrap_or_else(|index| index.min(indices.len() - 1));
         let next = position.saturating_add_signed(delta).min(indices.len() - 1);
         self.state.select(Some(indices[next]));
+        next != position
     }
     pub(crate) fn activate(&mut self) -> Option<Action> {
         if self.folded {
