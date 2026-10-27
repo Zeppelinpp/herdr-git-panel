@@ -176,6 +176,7 @@ Create or edit `config.json`, then close and reopen the panel. A complete exampl
 
 ```json
 {
+  "direction": "right",
   "push_key": "ctrl+p",
   "history_limit": 150,
   "auto_refresh": true,
@@ -189,6 +190,7 @@ Create or edit `config.json`, then close and reopen the panel. A complete exampl
 
 | Setting | Default | Description |
 | --- | --- | --- |
+| `direction` | `right` | Split direction relative to the invoking pane: `right` or `down`. Takes effect when the panel is reopened. Herdr does not currently support `left` or `up`. |
 | `push_key` | `ctrl+p` | Shortcut that opens push confirmation. |
 | `history_limit` | `150` | Commits loaded initially and per “Load older commits” action. Must be greater than zero. |
 | `auto_refresh` | `true` | Automatically refresh local changes. Set to `false` to refresh manually with `Ctrl+R`. |

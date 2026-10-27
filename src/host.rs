@@ -21,6 +21,7 @@ pub fn toggle_command() -> String {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    pub direction: String,
     pub push_key: String,
     pub history_limit: usize,
     pub auto_refresh: bool,
@@ -30,6 +31,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            direction: "right".into(),
             push_key: "ctrl+p".into(),
             history_limit: 150,
             auto_refresh: true,
@@ -48,6 +50,9 @@ impl Config {
         };
         if cfg.history_limit == 0 {
             bail!("history_limit must be greater than zero");
+        }
+        if !matches!(cfg.direction.as_str(), "right" | "down") {
+            bail!("direction must be right or down (supported by Herdr)");
         }
         Ok(cfg)
     }
@@ -409,6 +414,7 @@ pub fn toggle() -> Result<()> {
         .or_else(|| current.get("cwd").and_then(Value::as_str))
         .context("No repository working directory")?;
     let repo = Repo::discover(cwd)?;
+    let config = Config::load()?;
     cli(&[
         "plugin",
         "pane",
@@ -420,7 +426,7 @@ pub fn toggle() -> Result<()> {
         "--placement",
         "split",
         "--direction",
-        "right",
+        &config.direction,
         "--target-pane",
         pane,
         "--cwd",
