@@ -32,7 +32,7 @@ pub(crate) enum Request {
 }
 
 impl Request {
-    fn read(&self, repo: &Repo) -> Result<DiffData> {
+    pub(crate) fn read(&self, repo: &Repo) -> Result<DiffData> {
         match self {
             Self::Working { kind, path } => repo.working_diff_data(&WorkingFile {
                 stat: FileStat {
@@ -202,6 +202,12 @@ impl Preview {
         self.desired.is_some()
     }
 
+    /// Use the preview's identity, including an expanded history commit, rather
+    /// than inferring the popup source from a file list that may have moved.
+    pub(crate) fn request(&self) -> Option<Request> {
+        self.desired.clone()
+    }
+
     pub(crate) fn at_navigation_edge(&self, forward: bool) -> bool {
         self.viewer
             .as_ref()
@@ -260,7 +266,7 @@ impl Preview {
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
         let title = if focused {
-            "Diff · Esc files"
+            "Diff · Shift+Enter popup · Esc files"
         } else {
             "Diff · Enter focus"
         };

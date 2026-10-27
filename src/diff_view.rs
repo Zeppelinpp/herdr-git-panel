@@ -1,4 +1,4 @@
-//! Shared diff interaction for the Herdr popup and the standalone dialog.
+//! Shared diff rendering and interaction for inline previews and popup views.
 use crate::{
     diff::{Document, ExpandResult, PreparedContext, MAX_REVIEW_BYTES},
     git::DiffSource,

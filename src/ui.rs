@@ -11,8 +11,9 @@ use anyhow::{bail, Result};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -801,10 +802,12 @@ impl Panel {
         }
     }
     fn open_patch(&mut self, base: String, sha: String, path: String) {
-        let repo = self.repo.clone();
-        self.work("Reading diff…", move || {
-            Ok(Update::Diff(repo.diff_data(&base, &sha, &path)?))
-        });
+        let request = if sha.is_empty() {
+            PreviewRequest::Branch { base, path }
+        } else {
+            PreviewRequest::Commit { sha, path }
+        };
+        self.open_diff(request);
     }
     fn open_working_file(&mut self, index: usize) {
         let file = self
@@ -815,9 +818,16 @@ impl Panel {
         let Some(file) = file else {
             return;
         };
+        self.open_diff(PreviewRequest::Working {
+            kind: file.kind,
+            path: file.stat.path,
+        });
+    }
+
+    fn open_diff(&mut self, request: PreviewRequest) {
         let repo = self.repo.clone();
-        self.work("Reading working tree diff…", move || {
-            Ok(Update::Diff(repo.working_diff_data(&file)?))
+        self.work("Reading diff…", move || {
+            Ok(Update::Diff(request.read(&repo)?))
         });
     }
     fn capture_activation(&self) -> Option<Activation> {
@@ -1109,6 +1119,12 @@ impl Panel {
             return Ok(false);
         }
         if self.focus == Focus::Diff {
+            if key_matches(key, "shift+enter") {
+                if let Some(request) = self.preview.request() {
+                    self.open_diff(request);
+                }
+                return Ok(false);
+            }
             let forward = match key.code {
                 KeyCode::Char('j') | KeyCode::Down => Some(true),
                 KeyCode::Char('k') | KeyCode::Up => Some(false),
@@ -2203,14 +2219,24 @@ fn open_url(url: &str) -> Result<()> {
 struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         ratatui::restore();
     }
 }
 fn terminal() -> Result<(DefaultTerminal, TerminalGuard)> {
     let terminal = ratatui::try_init()?;
     let guard = TerminalGuard;
-    execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     Ok((terminal, guard))
 }
 pub fn run(repo: Repo, cfg: Config) -> Result<()> {
@@ -3347,6 +3373,89 @@ mod tests {
             panel.worker.is_none(),
             "inline browsing must not open a popup worker"
         );
+    }
+
+    fn popup_result(panel: &mut Panel) -> DiffData {
+        panel
+            .worker
+            .take()
+            .expect("popup read worker")
+            .join()
+            .unwrap();
+        match panel.receiver.recv().unwrap().unwrap() {
+            Update::Diff(data) => data,
+            _ => panic!("expected a popup diff"),
+        }
+    }
+
+    #[test]
+    fn shift_enter_opens_the_preview_source_and_keeps_inline_selection() {
+        let (_root, mut panel) = inline_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        wait_inline(&mut panel, &mut terminal, "FIRST_INLINE_CONTENT");
+        panel.focus = Focus::Diff;
+        panel.key(KeyEvent::from(KeyCode::Enter)).unwrap();
+        assert!(panel.worker.is_none(), "plain Enter stays in the viewer");
+        panel.key(KeyEvent::from(KeyCode::Char('v'))).unwrap();
+        assert!(panel.preview.review_active());
+
+        // A popup follows the preview, even if the file-list selection differs.
+        panel.working_files.select(Some(1));
+        panel
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .unwrap();
+        let data = popup_result(&mut panel);
+        assert!(data.patch.contains("FIRST_INLINE_CONTENT"));
+        assert!(!data.patch.contains("SECOND_INLINE_CONTENT"));
+        assert!(data.source.is_some());
+        assert!(panel.preview.review_active());
+        assert_eq!(panel.focus, Focus::Diff);
+
+        // The local popup uses the same Viewer and layered Escape handling.
+        panel.dialog = Some(Dialog::Diff(Box::new(Viewer::new(data, None))));
+        terminal.draw(|f| panel.render(f)).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Char('v'))).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Down)).unwrap();
+        panel.key(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(panel.dialog.is_some(), "first Escape cancels selection");
+        panel.key(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(panel.dialog.is_none());
+        assert!(panel.preview.review_active());
+        assert_eq!(panel.focus, Focus::Diff);
+        panel.key(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(!panel.preview.review_active());
+        assert_eq!(panel.focus, Focus::Diff);
+    }
+
+    #[test]
+    fn shift_enter_uses_the_current_branch_or_history_comparison() {
+        let (root, mut panel) = inline_fixture();
+        panel.repo.git(&["branch", "comparison-base"]).unwrap();
+        std::fs::write(root.path().join("base.txt"), "COMMITTED_POPUP\n").unwrap();
+        panel.repo.git(&["add", "base.txt"]).unwrap();
+        panel.repo.git(&["commit", "-m", "Change base"]).unwrap();
+        let sha = panel.repo.git(&["rev-parse", "HEAD"]).unwrap();
+        panel.focus = Focus::Diff;
+        for request in [
+            PreviewRequest::Branch {
+                base: "comparison-base".into(),
+                path: "base.txt".into(),
+            },
+            PreviewRequest::Commit {
+                sha: sha.trim().into(),
+                path: "base.txt".into(),
+            },
+        ] {
+            panel.preview.select(Some(request.clone()), None);
+            panel
+                .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+                .unwrap();
+            let data = popup_result(&mut panel);
+            let expected = request.read(&panel.repo).unwrap();
+            assert!(data.patch.contains("COMMITTED_POPUP"));
+            assert_eq!(data.patch, expected.patch);
+            assert_eq!(data.source, expected.source);
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 | Stage / unstage the selected changed file | `Space` |
 | Discard all changes to the selected changed file | `d`, then `y` to confirm or `n` to cancel |
 | Expand a commit / focus the selected diff | `Enter` |
-| Open the selected diff in a popup | `o` from the file list |
+| Open the selected diff in a popup | `Shift+Enter` from the inline diff, or `o` from the file list |
 | Select diff lines / choose an agent target | `v`, then arrows / `p` |
 | Commit | `Ctrl+S` |
 | Push | `Ctrl+P`, configurable |
@@ -47,13 +47,18 @@ Selecting a file previews its diff inline. With commit history collapsed, the
 preview fills the space below the compact file lists; expanded history shares
 that space with the preview. Press `Enter` on a file or click the preview to read
 it, and `Esc` to return to the file list. File clicks select without opening a popup.
+Press `Shift+Enter` in the inline diff for a larger popup covering 90% of the
+Herdr workspace width and 88% of its height. Both views share the same diff controls,
+including `v`, `p`, `Enter` and `a`. The popup reads the current file again; the inline
+view keeps its own cursor, selection and folds. Outside Herdr, it opens a local dialog.
+`Shift+Enter` requires a terminal that reports modified Enter keys.
 
 Diffs show each change with **five unchanged lines before and after**, fixed
 old/new line numbers, and folds for more distant context. Overlapping context
 windows appear once. Use `↑` / `↓` to move, `←` / `→` to pan code horizontally, `PageUp` /
 `PageDown` to move by a viewport, and `[` / `]` to jump between changes.
 On a folded row, `Enter` expands 20 lines next to the change (`t` explicitly expands
-from the beginning, `b` or `Shift+Enter` from the end), and `a` expands the whole
+from the beginning, `b` from the end), and `a` expands the whole
 interval. Click the left/right half of a folded row to expand from the
 beginning/end; Shift-click expands the whole
 interval. Press `Space` on expanded context or its remaining fold to collapse that
