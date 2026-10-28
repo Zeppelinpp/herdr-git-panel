@@ -10,7 +10,7 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 - **Committed changes:** see file statistics between the selected comparison branch and the current branch.
 - **Commit history:** browse a colored branch/merge graph. Expand multiple commits independently to inspect their file statistics and diffs. History starts collapsed to leave more room for working-tree changes.
 - **Commit:** enter a title and multiline description. Stage all changes, or commit only files already staged.
-- **Create MR / PR:** choose the remote, source branch, target branch, title and description. After creation, a clickable `!MR number ↗` link appears beside Create MR. Push the source branch before creating the request.
+- **Create PR/MR:** choose the remote, source branch, target branch, title and description. After creation, a clickable `!MR number ↗` link appears beside Create PR/MR. The action buttons size to their text and move the PR/MR button and link onto a second row when space is limited. Push the source branch before creating the request.
 - **Push:** push the current branch to the destination derived from the comparison branch. A confirmation shows the destination before pushing.
 - **Automatic refresh:** local file and Git changes update the panel while preserving your draft, selection and expanded commits.
 

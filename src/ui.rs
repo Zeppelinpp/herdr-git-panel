@@ -38,6 +38,56 @@ const NORMAL: Style = Style::new();
 const BOLD: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD);
 const DIM: Style = Style::new().fg(Color::Gray).add_modifier(Modifier::DIM);
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
+const ACTION_LABELS: [&str; 3] = ["[Commit]", "[Push]", "[Create PR/MR]"];
+
+struct ActionBarLayout {
+    buttons: [Rect; 3],
+    link: Rect,
+    height: u16,
+}
+
+impl ActionBarLayout {
+    fn new(area: Rect, labels: [&str; 3], link: Option<&str>) -> Self {
+        let width = |text: &str| {
+            u16::try_from(unicode_width::UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+        };
+        let widths = labels.map(width);
+        let gap = 3;
+        let prefix = widths[0].saturating_add(widths[1]).saturating_add(gap * 2);
+        let link_space = link.map_or(0, |text| width(text).saturating_add(1));
+        let wrapped = area.width < prefix.saturating_add(widths[2]).saturating_add(link_space);
+        let columns = Layout::horizontal([
+            Constraint::Length(widths[0].saturating_add(gap)),
+            Constraint::Length(widths[1].saturating_add(gap)),
+            Constraint::Min(0),
+        ])
+        .split(Rect::new(area.x, area.y, area.width, 1));
+        let last_row = if wrapped {
+            Rect::new(area.x, area.y.saturating_add(1), area.width, 1)
+        } else {
+            columns[2]
+        };
+        let rows = [columns[0], columns[1], last_row];
+        let buttons = std::array::from_fn(|i| {
+            Rect::new(rows[i].x, rows[i].y, widths[i].min(rows[i].width), 1)
+        });
+        let link_offset = widths[2].saturating_add(1).min(last_row.width);
+        let link = Rect::new(
+            last_row.x.saturating_add(link_offset),
+            last_row.y,
+            last_row
+                .width
+                .saturating_sub(link_offset)
+                .min(link.map_or(0, width)),
+            1,
+        );
+        Self {
+            buttons,
+            link,
+            height: if wrapped { 2 } else { 1 },
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -1520,17 +1570,14 @@ impl Panel {
             return;
         }
         let link = self.mr_link_label();
-        let wrap_actions = area.width
-            < 31 + link.as_ref().map_or(0, |label| {
-                unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 1
-            });
+        let action_height = ActionBarLayout::new(area, ACTION_LABELS, link.as_deref()).height;
         let outer = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(1),
-            Constraint::Length(if wrap_actions { 2 } else { 1 }),
+            Constraint::Length(action_height),
             Constraint::Length(2),
             Constraint::Min(6),
             Constraint::Length(1),
@@ -1606,24 +1653,13 @@ impl Panel {
             outer[4],
         );
         self.hits.push((outer[4], Hit::Focus(Focus::Stage)));
-        let action_row = Rect::new(outer[5].x, outer[5].y, outer[5].width, 1);
-        let buttons = Layout::horizontal([
-            Constraint::Length(11),
-            Constraint::Length(9),
-            Constraint::Min(0),
-        ])
-        .split(action_row);
-        let mr_row = if wrap_actions {
-            Rect::new(outer[5].x, outer[5].y + 1, outer[5].width, 1)
-        } else {
-            buttons[2]
-        };
-        let mr_button = Rect::new(mr_row.x, mr_row.y, mr_row.width.min(11), 1);
-        for (rect, focus, title) in [
-            (buttons[0], Focus::Commit, "[Commit]"),
-            (buttons[1], Focus::Push, "[Push]"),
-            (mr_button, Focus::Mr, "[Create MR]"),
-        ] {
+        let actions = ActionBarLayout::new(outer[5], ACTION_LABELS, link.as_deref());
+        for ((rect, focus), title) in actions
+            .buttons
+            .into_iter()
+            .zip([Focus::Commit, Focus::Push, Focus::Mr])
+            .zip(ACTION_LABELS)
+        {
             let enabled = self.can_focus(focus);
             frame.render_widget(
                 Paragraph::new(title).style(if !enabled {
@@ -1640,15 +1676,7 @@ impl Panel {
             }
         }
         if let Some(label) = link {
-            let rect = Rect::new(
-                mr_row.x + 12,
-                mr_row.y,
-                mr_row
-                    .width
-                    .saturating_sub(12)
-                    .min(unicode_width::UnicodeWidthStr::width(label.as_str()) as u16),
-                1,
-            );
+            let rect = actions.link;
             frame.render_widget(
                 Paragraph::new(label).style(
                     if self.focus == Focus::Link {
@@ -1976,7 +2004,7 @@ impl Panel {
             Dialog::Mr(form) => {
                 let area = dialog_area(frame.area(), 88, 27);
                 frame.render_widget(Clear, area);
-                let block = Block::bordered().title("Create MR / PR");
+                let block = Block::bordered().title("Create PR/MR");
                 let inner = block.inner(area);
                 frame.render_widget(block, area);
                 let layout = Layout::vertical([
@@ -2717,6 +2745,52 @@ mod tests {
         assert!(panel.history.folded());
     }
     #[test]
+    fn action_bar_adapts_to_label_display_widths_without_clipping_or_overlapping() {
+        for width in [26, 33, 43, 60] {
+            for title in ["[Create PR]", "[Create PR/MR]", "[创建合并请求]"] {
+                let labels = ["[Commit]", "[Push]", title];
+                let link = "!MR 123 ↗";
+                let area = Rect::new(2, 1, width, 2);
+                let layout = ActionBarLayout::new(area, labels, Some(link));
+                let mut terminal = Terminal::new(TestBackend::new(width + 4, 4)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        for (rect, label) in layout.buttons.into_iter().zip(labels) {
+                            frame.render_widget(Paragraph::new(label), rect);
+                        }
+                        frame.render_widget(Paragraph::new(link), layout.link);
+                    })
+                    .unwrap();
+                for (rect, label) in layout
+                    .buttons
+                    .into_iter()
+                    .zip(labels)
+                    .chain(std::iter::once((layout.link, link)))
+                {
+                    let mut x = rect.x;
+                    for ch in label.chars() {
+                        assert_eq!(
+                            terminal.backend().buffer()[(x, rect.y)].symbol(),
+                            ch.to_string(),
+                            "{title} at width {width}"
+                        );
+                        x += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                    }
+                }
+                for rect in layout.buttons {
+                    assert!(rect.x >= area.x && rect.right() <= area.right());
+                }
+                assert_eq!(layout.link.x, layout.buttons[2].right() + 1);
+                assert_eq!(layout.link.y, layout.buttons[2].y);
+                assert!(layout.link.right() <= area.right());
+                if layout.height == 2 {
+                    assert_eq!(layout.buttons[2].y, area.y + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn created_mr_link_sits_beside_button_at_wide_and_narrow_widths() {
         for width in [26, 42, 60] {
             for url in [
@@ -2754,7 +2828,7 @@ mod tests {
                 assert!(link.right() <= width);
                 assert!(dump(&terminal)
                     .iter()
-                    .any(|line| line.contains("[Create MR] !MR 123 ↗")));
+                    .any(|line| line.contains("[Create PR/MR] !MR 123 ↗")));
                 panel.focus = Focus::Mr;
                 panel.change_focus(false);
                 assert_eq!(
