@@ -995,7 +995,7 @@ impl Repo {
         let base = if branches.iter().any(|b| b == selected) {
             selected.to_string()
         } else {
-            ["origin/main", "origin/master", "main", "master", &branch]
+            [&branch, "origin/main", "origin/master", "main", "master"]
                 .iter()
                 .find(|b| branches.iter().any(|s| s == **b))
                 .map(|s| s.to_string())

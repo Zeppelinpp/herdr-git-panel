@@ -15,6 +15,37 @@ fn git(path: &Path, args: &[&str]) -> String {
     );
     String::from_utf8_lossy(&output.stdout).trim().into()
 }
+
+#[test]
+fn default_comparison_uses_current_local_branch_and_preserves_explicit_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    git(path, &["init", "-b", "main"]);
+    git(path, &["config", "user.name", "Test"]);
+    git(path, &["config", "user.email", "test@example.invalid"]);
+    fs::write(path.join("file"), "base\n").unwrap();
+    git(path, &["add", "."]);
+    git(path, &["commit", "-m", "initial"]);
+    git(path, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(path, &["checkout", "-b", "feature"]);
+    fs::write(path.join("file"), "committed\n").unwrap();
+    git(path, &["commit", "-am", "feature change"]);
+    fs::write(path.join("file"), "working\n").unwrap();
+
+    let repo = Repo::discover(path).unwrap();
+    for selected in ["", "deleted-branch"] {
+        let snapshot = repo.snapshot(selected, 10).unwrap();
+        assert_eq!(snapshot.base, "feature");
+        assert!(snapshot.files.is_empty());
+        assert_eq!(snapshot.working.files.len(), 1);
+    }
+    let snapshot = repo.snapshot("origin/main", 10).unwrap();
+    assert_eq!(snapshot.base, "origin/main");
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].path, "file");
+    assert_eq!(snapshot.working.files.len(), 1);
+}
+
 #[test]
 fn summary_and_numstat_use_the_same_tips_if_head_moves_between_queries() {
     let dir = tempfile::tempdir().unwrap();

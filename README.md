@@ -4,7 +4,7 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 
 ## Features
 
-- **Branch comparison:** search local and already fetched remote branches by name. The panel never fetches automatically.
+- **Branch comparison:** defaults to the current local branch. Search local and already fetched remote branches by name to choose another comparison. The panel never fetches automatically.
 - **Working-tree changes:** browse unstaged, staged and untracked files. The selected file's diff appears directly below the file lists.
 - **Send selected changes to an agent:** select diff lines and press `p` to choose an available Herdr agent pane in the current workspace.
 - **Committed changes:** see file statistics between the selected comparison branch and the current branch.
