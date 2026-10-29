@@ -456,7 +456,7 @@ pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Ve
         output.push(DisplayRow {
             item: Item::Detail,
             line: detail_line(
-                row,
+                &geometry,
                 &format!("{} · {}", visible(&row.author), row.date),
                 width,
             ),
@@ -605,7 +605,7 @@ mod tests {
             60,
         );
         assert_eq!(original.last().unwrap().line, expanded.last().unwrap().line);
-        assert_eq!(original.last().unwrap().item, Item::Commit(1));
+        assert_eq!(original.last().unwrap().item, Item::Detail);
         assert!(expanded[0].item.selectable());
         assert!(!expanded[1].item.selectable());
     }
@@ -631,11 +631,11 @@ mod tests {
             .iter()
             .map(|row| row.line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(projected.len(), 4);
+        assert_eq!(projected.len(), 8);
         assert!(lines[0].starts_with("○─╮"), "{}", lines[0]);
-        assert!(lines[1].starts_with("│ ●"), "{}", lines[1]);
-        assert!(lines[2].starts_with("●─╯"), "{}", lines[2]);
-        assert!(lines[3].starts_with('●'), "{}", lines[3]);
+        assert!(lines[2].starts_with("│ ●"), "{}", lines[2]);
+        assert!(lines[4].starts_with("●─╯"), "{}", lines[4]);
+        assert!(lines[6].starts_with('●'), "{}", lines[6]);
         assert!(!projected.iter().any(|row| row.item == Item::Connector));
     }
     #[test]
@@ -652,7 +652,13 @@ mod tests {
             ..Default::default()
         };
         let rows = project(&[first, second], &[], 42);
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| matches!(row.item, Item::Commit(_))));
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().enumerate().all(|(index, row)| {
+            if index % 2 == 0 {
+                matches!(row.item, Item::Commit(_))
+            } else {
+                row.item == Item::Detail
+            }
+        }));
     }
 }
