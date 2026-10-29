@@ -1,10 +1,11 @@
-//! Compact commit rows modeled on the supplied Orca panel reference.
-//! Git owns topology/color identity; this module only projects it into cells.
+//! Compact commit rows modeled on the Orca and lazygit panel references.
+//! Commit parents own topology; Git supplies node color identity.
 use crate::git::{FileStat, GraphRow};
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
 };
+use std::collections::HashSet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[cfg(test)]
@@ -76,42 +77,312 @@ pub fn truncate(value: &str, width: usize) -> String {
     result.push('…');
     result
 }
-fn track(row: &GraphRow, index: usize) -> Style {
-    let color = row
-        .lane_colors
-        .get(index)
-        .copied()
-        .flatten()
-        .map(usize::from)
-        .unwrap_or(index / 2)
-        % TRACKS.len();
-    Style::new().fg(TRACKS[color])
+// Pipes connect commit parents. Each projected cell records its incoming and
+// outgoing directions so joins use rounded corners instead of diagonal glyphs.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PipeKind {
+    Terminates,
+    Starts,
+    Continues,
 }
-fn lanes(row: &GraphRow, continuation: bool) -> Vec<Span<'static>> {
+#[derive(Clone)]
+struct Pipe {
+    to_hash: String,
+    from_pos: usize,
+    to_pos: usize,
+    kind: PipeKind,
+    color: usize,
+}
+impl Pipe {
+    fn left(&self) -> usize {
+        self.from_pos.min(self.to_pos)
+    }
+    fn right(&self) -> usize {
+        self.from_pos.max(self.to_pos)
+    }
+}
+
+const EMPTY_TREE_HASH: &str = "\0empty-tree";
+
+fn node_color(row: &GraphRow) -> usize {
     row.lanes
         .chars()
-        .enumerate()
-        .map(|(i, c)| {
-            let glyph = if continuation {
-                match c {
-                    '*' if row.parents.is_empty() => ' ',
-                    '*' | '|' | '/' | '\\' => '│',
-                    _ => ' ',
+        .position(|c| c == '*')
+        .and_then(|column| row.lane_colors.get(column).copied().flatten())
+        .map(usize::from)
+        .unwrap_or(0)
+        % TRACKS.len()
+}
+fn track(color: usize) -> Style {
+    Style::new().fg(TRACKS[color % TRACKS.len()])
+}
+fn traverse(from: usize, to: usize, taken: &mut HashSet<usize>, traversed: &mut HashSet<usize>) {
+    for position in from.min(to)..=from.max(to) {
+        traversed.insert(position);
+    }
+    taken.insert(to);
+}
+fn next_pipes(previous: &[Pipe], row: &GraphRow) -> Vec<Pipe> {
+    let max_pos = previous.iter().map(|pipe| pipe.to_pos).max().unwrap_or(0);
+    let current = previous
+        .iter()
+        .filter(|pipe| pipe.kind != PipeKind::Terminates)
+        .cloned()
+        .collect::<Vec<_>>();
+    let position = current
+        .iter()
+        .find(|pipe| pipe.to_hash == row.sha)
+        .map_or(max_pos + 1, |pipe| pipe.to_pos);
+    let color = node_color(row);
+    let first_parent = row
+        .parents
+        .first()
+        .cloned()
+        .unwrap_or_else(|| EMPTY_TREE_HASH.to_string());
+    let mut next = vec![Pipe {
+        to_hash: first_parent,
+        from_pos: position,
+        to_pos: position,
+        kind: PipeKind::Starts,
+        color,
+    }];
+    let mut taken = HashSet::new();
+    let mut traversed = HashSet::new();
+    let continuing = current
+        .iter()
+        .filter(|pipe| pipe.to_hash != row.sha)
+        .map(|pipe| pipe.to_pos)
+        .collect::<HashSet<_>>();
+
+    for pipe in &current {
+        if pipe.to_hash == row.sha {
+            next.push(Pipe {
+                from_pos: pipe.to_pos,
+                to_pos: position,
+                kind: PipeKind::Terminates,
+                ..pipe.clone()
+            });
+            traverse(pipe.to_pos, position, &mut taken, &mut traversed);
+        } else if pipe.to_pos < position {
+            let available = (0..)
+                .find(|position| !traversed.contains(position))
+                .expect("an unoccupied graph position");
+            next.push(Pipe {
+                from_pos: pipe.to_pos,
+                to_pos: available,
+                kind: PipeKind::Continues,
+                ..pipe.clone()
+            });
+            traverse(pipe.to_pos, available, &mut taken, &mut traversed);
+        }
+    }
+    for parent in row.parents.iter().skip(1) {
+        let available = (0..)
+            .find(|position| !taken.contains(position) && !continuing.contains(position))
+            .expect("an untraversed graph position");
+        next.push(Pipe {
+            to_hash: parent.clone(),
+            from_pos: position,
+            to_pos: available,
+            kind: PipeKind::Starts,
+            color,
+        });
+        taken.insert(available);
+    }
+    for pipe in &current {
+        if pipe.to_hash == row.sha || pipe.to_pos <= position {
+            continue;
+        }
+        let mut last = pipe.to_pos;
+        for candidate in (position..pipe.to_pos).rev() {
+            if taken.contains(&candidate) || traversed.contains(&candidate) {
+                break;
+            }
+            last = candidate;
+        }
+        next.push(Pipe {
+            from_pos: pipe.to_pos,
+            to_pos: last,
+            kind: PipeKind::Continues,
+            ..pipe.clone()
+        });
+        traverse(pipe.to_pos, last, &mut taken, &mut traversed);
+    }
+    next.sort_by_key(|pipe| (pipe.to_pos, pipe.kind));
+    next
+}
+fn pipe_sets(rows: &[GraphRow]) -> Vec<Vec<Pipe>> {
+    let mut commits = rows.iter().filter(|row| !row.sha.is_empty());
+    let Some(first) = commits.next() else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    let mut pipes = vec![Pipe {
+        to_hash: first.sha.clone(),
+        from_pos: 0,
+        to_pos: 0,
+        kind: PipeKind::Starts,
+        color: node_color(first),
+    }];
+    for row in std::iter::once(first).chain(commits) {
+        pipes = next_pipes(&pipes, row);
+        output.push(pipes.clone());
+    }
+    output
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellKind {
+    Connection,
+    Commit,
+    Merge,
+}
+struct Cell {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    kind: CellKind,
+    color: usize,
+    right_color: Option<usize>,
+}
+impl Cell {
+    fn new() -> Self {
+        Self {
+            up: false,
+            down: false,
+            left: false,
+            right: false,
+            kind: CellKind::Connection,
+            color: 0,
+            right_color: None,
+        }
+    }
+    fn set_up(&mut self, color: usize) {
+        self.up = true;
+        self.color = color;
+    }
+    fn set_down(&mut self, color: usize) {
+        self.down = true;
+        self.color = color;
+    }
+    fn set_left(&mut self, color: usize) {
+        self.left = true;
+        if !self.up && !self.down {
+            self.color = color;
+        }
+    }
+    fn set_right(&mut self, color: usize, override_color: bool) {
+        self.right = true;
+        if self.right_color.is_none() || override_color {
+            self.right_color = Some(color);
+        }
+    }
+}
+struct Geometry {
+    cells: Vec<Cell>,
+}
+impl Geometry {
+    fn new(pipes: &[Pipe], row: &GraphRow) -> Self {
+        let max_pos = pipes.iter().map(|pipe| pipe.right()).max().unwrap_or(0);
+        let commit_pos = pipes
+            .iter()
+            .find_map(|pipe| match pipe.kind {
+                PipeKind::Starts => Some(pipe.from_pos),
+                PipeKind::Terminates => Some(pipe.to_pos),
+                PipeKind::Continues => None,
+            })
+            .unwrap_or(0);
+        let merge = pipes
+            .iter()
+            .filter(|pipe| pipe.kind == PipeKind::Starts)
+            .count()
+            > 1;
+        let mut cells = (0..=max_pos).map(|_| Cell::new()).collect::<Vec<_>>();
+        let mut render = |pipe: &Pipe, override_right: bool| {
+            let left = pipe.left();
+            let right = pipe.right();
+            if left != right {
+                for cell in &mut cells[left + 1..right] {
+                    cell.set_left(pipe.color);
+                    cell.set_right(pipe.color, override_right);
                 }
+                cells[left].set_right(pipe.color, override_right);
+                cells[right].set_left(pipe.color);
+            }
+            if matches!(pipe.kind, PipeKind::Starts | PipeKind::Continues)
+                && pipe.to_hash != EMPTY_TREE_HASH
+            {
+                cells[pipe.to_pos].set_down(pipe.color);
+            }
+            if matches!(pipe.kind, PipeKind::Terminates | PipeKind::Continues) {
+                cells[pipe.from_pos].set_up(pipe.color);
+            }
+        };
+        for pipe in pipes.iter().filter(|pipe| pipe.kind == PipeKind::Starts) {
+            render(pipe, true);
+        }
+        for pipe in pipes.iter().filter(|pipe| {
+            pipe.kind != PipeKind::Starts
+                && !(pipe.kind == PipeKind::Terminates
+                    && pipe.from_pos == commit_pos
+                    && pipe.to_pos == commit_pos)
+        }) {
+            render(pipe, false);
+        }
+        cells[commit_pos].kind = if merge {
+            CellKind::Merge
+        } else {
+            CellKind::Commit
+        };
+        cells[commit_pos].color = node_color(row);
+        Self { cells }
+    }
+    fn width(&self) -> usize {
+        self.cells.len() * 2
+    }
+    fn spans(&self, continuation: bool) -> Vec<Span<'static>> {
+        let mut spans = Vec::with_capacity(self.cells.len() * 2);
+        for cell in &self.cells {
+            let (first, second) = if continuation {
+                (if cell.down { '│' } else { ' ' }, ' ')
             } else {
-                match c {
-                    '*' if row.parents.len() > 1 => '○',
-                    '*' => '●',
-                    '|' => '│',
-                    '/' => '╱',
-                    '\\' => '╲',
-                    '_' | '-' => '─',
-                    _ => c,
-                }
+                let (connection, second) = box_drawing(cell.up, cell.down, cell.left, cell.right);
+                let first = match cell.kind {
+                    CellKind::Connection => connection,
+                    CellKind::Commit => '●',
+                    CellKind::Merge => '○',
+                };
+                (first, second)
             };
-            Span::styled(glyph.to_string(), track(row, i))
-        })
-        .collect()
+            spans.push(Span::styled(first.to_string(), track(cell.color)));
+            spans.push(Span::styled(
+                second.to_string(),
+                track(cell.right_color.unwrap_or(cell.color)),
+            ));
+        }
+        spans
+    }
+}
+fn box_drawing(up: bool, down: bool, left: bool, right: bool) -> (char, char) {
+    match (up, down, left, right) {
+        (true, true, true, true) => ('│', '─'),
+        (true, true, true, false) => ('│', ' '),
+        (true, true, false, true) => ('│', '─'),
+        (true, true, false, false) => ('│', ' '),
+        (true, false, true, true) => ('┴', '─'),
+        (true, false, true, false) => ('╯', ' '),
+        (true, false, false, true) => ('╰', '─'),
+        (true, false, false, false) => ('╵', ' '),
+        (false, true, true, true) => ('┬', '─'),
+        (false, true, true, false) => ('╮', ' '),
+        (false, true, false, true) => ('╭', '─'),
+        (false, true, false, false) => ('╷', ' '),
+        (false, false, true, true) => ('─', '─'),
+        (false, false, true, false) => ('─', ' '),
+        (false, false, false, true) => ('╶', '─'),
+        (false, false, false, false) => (' ', ' '),
+    }
 }
 fn label(row: &GraphRow, width: usize) -> Option<String> {
     if row.refs.is_empty() || width < 26 {
@@ -128,9 +399,9 @@ fn label(row: &GraphRow, width: usize) -> Option<String> {
     let raw = format!("{first}{suffix}");
     Some(format!("({})", truncate(&raw, available.saturating_sub(2))))
 }
-fn commit_line(row: &GraphRow, expanded: bool, width: usize) -> Line<'static> {
-    let mut spans = lanes(row, false);
-    let prefix = UnicodeWidthStr::width(row.lanes.as_str());
+fn commit_line(row: &GraphRow, geometry: &Geometry, expanded: bool, width: usize) -> Line<'static> {
+    let mut spans = geometry.spans(false);
+    let prefix = geometry.width();
     let available = width.saturating_sub(prefix + 3);
     spans.push(Span::styled(
         if expanded { " ▾ " } else { " › " },
@@ -152,10 +423,10 @@ fn commit_line(row: &GraphRow, expanded: bool, width: usize) -> Line<'static> {
     }
     Line::from(spans)
 }
-fn detail_line(row: &GraphRow, text: &str, width: usize) -> Line<'static> {
-    let mut spans = lanes(row, true);
+fn detail_line(geometry: &Geometry, text: &str, width: usize) -> Line<'static> {
+    let mut spans = geometry.spans(true);
     spans.push(Span::raw("   "));
-    let available = width.saturating_sub(UnicodeWidthStr::width(row.lanes.as_str()) + 3);
+    let available = width.saturating_sub(geometry.width() + 3);
     spans.push(Span::styled(
         truncate(text, available),
         Style::new().fg(Color::Gray),
@@ -170,18 +441,17 @@ pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Ve
         .map(|d| (d.sha, d))
         .collect::<std::collections::HashMap<_, _>>();
     let mut output = Vec::new();
+    let mut pipe_sets = pipe_sets(rows).into_iter();
     for (index, row) in rows.iter().enumerate() {
         if row.sha.is_empty() {
-            output.push(DisplayRow {
-                item: Item::Connector,
-                line: Line::from(lanes(row, false)),
-            });
             continue;
         }
+        let pipes = pipe_sets.next().expect("one pipe set per commit");
+        let geometry = Geometry::new(&pipes, row);
         let detail = expanded.get(row.sha.as_str());
         output.push(DisplayRow {
             item: Item::Commit(index),
-            line: commit_line(row, detail.is_some(), width),
+            line: commit_line(row, &geometry, detail.is_some(), width),
         });
         if let Some(detail) = detail {
             let totals = detail
@@ -202,17 +472,17 @@ pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Ve
             );
             output.push(DisplayRow {
                 item: Item::Detail,
-                line: detail_line(row, &meta, width),
+                line: detail_line(&geometry, &meta, width),
             });
             for (file_index, file) in detail.files.iter().enumerate() {
-                let mut spans = lanes(row, true);
+                let mut spans = geometry.spans(true);
                 spans.push(Span::raw("   "));
                 let stats = if file.added == "-" {
                     "binary".to_string()
                 } else {
                     format!("+{} -{}", file.added, file.deleted)
                 };
-                let budget = width.saturating_sub(UnicodeWidthStr::width(row.lanes.as_str()) + 3);
+                let budget = width.saturating_sub(geometry.width() + 3);
                 let path = truncate(&visible(&file.path), budget.saturating_sub(stats.len() + 2));
                 spans.push(Span::raw(path));
                 spans.push(Span::raw("  "));
@@ -236,17 +506,9 @@ pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Ve
             if detail.files.is_empty() {
                 output.push(DisplayRow {
                     item: Item::Detail,
-                    line: detail_line(row, "No file changes", width),
+                    line: detail_line(&geometry, "No file changes", width),
                 });
             }
-        }
-        // Git omits connector-only rows for straight first-parent history.
-        // Keep a visible rail and breathing room between those commit nodes.
-        if rows.get(index + 1).is_some_and(|next| !next.sha.is_empty()) {
-            output.push(DisplayRow {
-                item: Item::Connector,
-                line: Line::from(lanes(row, true)),
-            });
         }
     }
     output
@@ -269,8 +531,10 @@ mod tests {
     #[test]
     fn unicode_nodes_and_labels_fit_the_available_cells() {
         let row = sample();
+        let pipes = pipe_sets(std::slice::from_ref(&row));
+        let geometry = Geometry::new(&pipes[0], &row);
         for width in [26, 42, 60, 90] {
-            let line = commit_line(&row, false, width);
+            let line = commit_line(&row, &geometry, false, width);
             assert!(line.width() <= width);
             let plain = line.to_string();
             assert!(plain.contains('○'));
@@ -311,7 +575,9 @@ mod tests {
     fn details_do_not_change_following_graph_geometry() {
         let row = sample();
         let next = GraphRow {
-            lanes: "|/  ".into(),
+            lanes: "* ".into(),
+            sha: "a".into(),
+            parents: vec!["z".into()],
             ..Default::default()
         };
         let original = project(&[row.clone(), next.clone()], &[], 60);
@@ -325,12 +591,41 @@ mod tests {
             60,
         );
         assert_eq!(original.last().unwrap().line, expanded.last().unwrap().line);
-        assert_eq!(original.last().unwrap().item, Item::Connector);
+        assert_eq!(original.last().unwrap().item, Item::Commit(1));
         assert!(expanded[0].item.selectable());
         assert!(!expanded[1].item.selectable());
     }
     #[test]
-    fn straight_history_has_continuous_rails_between_nodes() {
+    fn merge_history_uses_rounded_connectors_without_extra_rows() {
+        let commits = [
+            ("a", vec!["b", "c"]),
+            ("c", vec!["b"]),
+            ("b", vec!["d"]),
+            ("d", vec![]),
+        ];
+        let rows = commits
+            .into_iter()
+            .map(|(sha, parents)| GraphRow {
+                lanes: "* ".into(),
+                sha: sha.into(),
+                parents: parents.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let projected = project(&rows, &[], 42);
+        let lines = projected
+            .iter()
+            .map(|row| row.line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(projected.len(), 4);
+        assert!(lines[0].starts_with("○─╮"), "{}", lines[0]);
+        assert!(lines[1].starts_with("│ ●"), "{}", lines[1]);
+        assert!(lines[2].starts_with("●─╯"), "{}", lines[2]);
+        assert!(lines[3].starts_with('●'), "{}", lines[3]);
+        assert!(!projected.iter().any(|row| row.item == Item::Connector));
+    }
+    #[test]
+    fn straight_history_does_not_insert_connector_rows() {
         let first = GraphRow {
             lanes: "* ".into(),
             sha: "a".into(),
@@ -343,8 +638,7 @@ mod tests {
             ..Default::default()
         };
         let rows = project(&[first, second], &[], 42);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1].item, Item::Connector);
-        assert_eq!(rows[1].line.to_string(), "│ ");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| matches!(row.item, Item::Commit(_))));
     }
 }

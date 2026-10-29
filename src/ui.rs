@@ -3716,7 +3716,7 @@ mod tests {
                     short: "abc1234".into(),
                     subject: "Merge feature".into(),
                     refs: "HEAD -> main".into(),
-                    parents: vec!["a".into(), "b".into()],
+                    parents: vec!["ace12345".into(), "def12345".into()],
                     ..Default::default()
                 },
                 GraphRow {
@@ -3729,6 +3729,7 @@ mod tests {
                     short: "def1234".into(),
                     subject: "Feature".into(),
                     refs: "feature".into(),
+                    parents: vec!["bad12345".into()],
                     ..Default::default()
                 },
                 GraphRow {
@@ -3736,6 +3737,7 @@ mod tests {
                     sha: "ace12345".into(),
                     short: "ace1234".into(),
                     subject: "Main update".into(),
+                    parents: vec!["bad12345".into()],
                     ..Default::default()
                 },
                 GraphRow {
@@ -3795,7 +3797,7 @@ mod tests {
                     .unwrap(),
                 lane_x
             );
-            assert!(after.iter().any(|l| l.contains("│╲")));
+            assert!(after.iter().any(|l| l.contains("○─╮")));
             assert!(after.iter().any(|l| l.contains("COMMITS 4")));
             assert!(!before.iter().any(|l| l.contains("abc1234")));
             assert!(after.iter().any(|l| l.contains("feature.rs")));
