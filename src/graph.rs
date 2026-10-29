@@ -183,6 +183,14 @@ pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Ve
             item: Item::Commit(index),
             line: commit_line(row, detail.is_some(), width),
         });
+        output.push(DisplayRow {
+            item: Item::Detail,
+            line: detail_line(
+                row,
+                &format!("{} · {}", visible(&row.author), row.date),
+                width,
+            ),
+        });
         if let Some(detail) = detail {
             let totals = detail
                 .summary
@@ -262,6 +270,8 @@ mod tests {
             sha: "123".into(),
             short: "1234567".into(),
             subject: "合并分支并更新用户输入与个人助理功能".into(),
+            author: "Alice".into(),
+            date: "2025-10-29 | 10:38".into(),
             refs: "origin/feature-long-branch".into(),
             parents: vec!["a".into(), "b".into()],
         }
@@ -300,12 +310,16 @@ mod tests {
             }],
             60,
         );
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[2].item, Item::File(0, 0));
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3].item, Item::File(0, 0));
         assert!(rows[0].line.to_string().contains('▾'));
-        assert!(rows[1].line.to_string().starts_with("│ │"));
-        assert_eq!(rows[2].line.spans[2].style.fg, Some(Color::Yellow));
-        assert!(rows[2].line.to_string().contains("+12 -3"));
+        assert_eq!(
+            rows[1].line.to_string(),
+            "│ │    Alice · 2025-10-29 | 10:38"
+        );
+        assert!(rows[2].line.to_string().starts_with("│ │"));
+        assert_eq!(rows[3].line.spans[2].style.fg, Some(Color::Yellow));
+        assert!(rows[3].line.to_string().contains("+12 -3"));
     }
     #[test]
     fn details_do_not_change_following_graph_geometry() {
@@ -343,8 +357,8 @@ mod tests {
             ..Default::default()
         };
         let rows = project(&[first, second], &[], 42);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1].item, Item::Connector);
-        assert_eq!(rows[1].line.to_string(), "│ ");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[2].item, Item::Connector);
+        assert_eq!(rows[2].line.to_string(), "│ ");
     }
 }

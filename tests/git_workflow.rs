@@ -63,7 +63,22 @@ fn root_commit_special_filenames_and_merge_graph() {
     let rows = repo.graph(100).unwrap();
     assert_eq!(rows[0].parents.len(), 2);
     assert!(rows.iter().any(|r| r.lanes.contains('/')));
-    assert_eq!(rows.iter().filter(|r| !r.sha.is_empty()).count(), 4);
+    let commits = rows
+        .iter()
+        .filter(|r| !r.sha.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(commits.len(), 4);
+    assert!(commits.iter().all(|row| row.author == "Test"));
+    assert!(commits.iter().all(|row| {
+        row.date.len() == 18
+            && row.date.chars().enumerate().all(|(index, c)| match index {
+                4 | 7 => c == '-',
+                10 | 12 => c == ' ',
+                11 => c == '|',
+                15 => c == ':',
+                _ => c.is_ascii_digit(),
+            })
+    }));
 }
 #[test]
 fn staged_only_preserves_unstaged_changes_and_empty_title_does_not_stage() {

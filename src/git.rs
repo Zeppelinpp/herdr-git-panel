@@ -301,6 +301,9 @@ pub struct GraphRow {
     pub sha: String,
     pub short: String,
     pub subject: String,
+    pub author: String,
+    /// Author date formatted as yyyy-MM-dd | HH:mm.
+    pub date: String,
     pub refs: String,
     pub parents: Vec<String>,
 }
@@ -955,7 +958,8 @@ impl Repo {
             "--topo-order",
             "--decorate=short",
             &format!("-{limit}"),
-            "--format=%x1f%H%x1f%h%x1f%s%x1f%d%x1f%P",
+            "--date=format:%Y-%m-%d | %H:%M",
+            "--format=%x1f%H%x1f%h%x1f%s%x1f%an%x1f%ad%x1f%d%x1f%P",
             "HEAD",
             "--",
         ])?;
@@ -963,8 +967,8 @@ impl Repo {
             .lines()
             .map(|line| {
                 let (line, lane_colors) = decode_graph_line(line);
-                let f: Vec<_> = line.splitn(6, '\x1f').collect();
-                if f.len() != 6 {
+                let f: Vec<_> = line.splitn(8, '\x1f').collect();
+                if f.len() != 8 {
                     return GraphRow {
                         lanes: line,
                         lane_colors,
@@ -977,12 +981,14 @@ impl Repo {
                     sha: f[1].into(),
                     short: f[2].into(),
                     subject: f[3].into(),
-                    refs: f[4]
+                    author: f[4].into(),
+                    date: f[5].into(),
+                    refs: f[6]
                         .trim()
                         .trim_start_matches('(')
                         .trim_end_matches(')')
                         .into(),
-                    parents: f[5].split_whitespace().map(str::to_string).collect(),
+                    parents: f[7].split_whitespace().map(str::to_string).collect(),
                 }
             })
             .collect();
