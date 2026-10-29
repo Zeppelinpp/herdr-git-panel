@@ -14,6 +14,12 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 - **Push:** push the current branch to the destination derived from the comparison branch. A confirmation shows the destination before pushing.
 - **Automatic refresh:** local file and Git changes update the panel while preserving your draft, selection and expanded commits.
 
+### Panel preview
+
+The panel combines branch selection, working-tree changes, commit controls, inline diffs, and commit history. Each commit shows its message, author, and date (`YYYY-MM-DD | HH:mm`) on two compact lines, with a colored graph for branch and merge relationships.
+
+![Full Git panel rendered from a temporary mock repository](docs/panel-preview.png)
+
 | Action | Shortcut |
 | --- | --- |
 | Open / close the panel | `Cmd+Shift+R` after setup |

@@ -49,10 +49,19 @@ fn main() -> Result<()> {
     git(path, &["add", "."])?;
     git(path, &["commit", "-m", "Initial commit"])?;
     let branches = [
-        ("task-sit-work", "feat(bootstrap): ERP 用户信息刷新"),
-        ("dev-to-sit-zhihui", "feat(skill): 支持多轮任务与上下文"),
-        ("feature-sit", "feat(event): manage_ling 用户输入与个人助理"),
-        ("hotfix-lgmm", "fix: 定时任务与对话状态修复"),
+        ("feature-user-profile", "feat(profile): add avatar upload"),
+        (
+            "feature-chat-history",
+            "feat(chat): save conversation history",
+        ),
+        (
+            "feature-notifications",
+            "feat(notify): add desktop notifications",
+        ),
+        (
+            "fix-session-restore",
+            "fix(session): restore expired sessions",
+        ),
     ];
     for (branch, message) in branches {
         git(path, &["checkout", "-b", branch, "main"])?;
@@ -61,10 +70,10 @@ fn main() -> Result<()> {
         git(path, &["commit", "-m", message])?;
     }
     for (dest, source) in [
-        ("dev-to-sit-zhihui", "task-sit-work"),
-        ("feature-sit", "dev-to-sit-zhihui"),
-        ("hotfix-lgmm", "feature-sit"),
-        ("main", "hotfix-lgmm"),
+        ("feature-chat-history", "feature-user-profile"),
+        ("feature-notifications", "feature-chat-history"),
+        ("fix-session-restore", "feature-notifications"),
+        ("main", "fix-session-restore"),
     ] {
         git(path, &["checkout", dest])?;
         git(
