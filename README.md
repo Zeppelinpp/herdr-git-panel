@@ -18,7 +18,7 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 
 The panel combines branch selection, working-tree changes, commit controls, inline diffs, and commit history. Each commit shows its message, author, and date (`YYYY-MM-DD | HH:mm`) on two compact lines, with a colored graph for branch and merge relationships.
 
-![Full Git panel rendered from a temporary mock repository](docs/panel-preview.png)
+![Full Git panel preview](docs/panel-preview.png)
 
 | Action | Shortcut |
 | --- | --- |

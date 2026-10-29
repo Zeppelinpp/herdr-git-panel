@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.4] - 2026-10-29
+
+### Added
+
+- Show the commit message, author and date (`YYYY-MM-DD | HH:mm`) in compact two-line history entries.
+- Add a full-panel README preview.
+
+### Changed
+
+- Default branch comparisons to the current local branch and rename the request action to **Create PR/MR**.
+- Render branch and merge relationships with rounded graph connectors and remove extra connector spacing between commits.
+
 ## [0.7.3] - 2026-10-28
 
 ### Added

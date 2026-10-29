@@ -1,6 +1,6 @@
 [package]
 name = "herdr-git-panel"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 rust-version = "1.88"
 description = "Branch-aware Git sidebar for Herdr"
