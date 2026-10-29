@@ -248,14 +248,6 @@ pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Ve
                 });
             }
         }
-        // Git omits connector-only rows for straight first-parent history.
-        // Keep a visible rail and breathing room between those commit nodes.
-        if rows.get(index + 1).is_some_and(|next| !next.sha.is_empty()) {
-            output.push(DisplayRow {
-                item: Item::Connector,
-                line: Line::from(lanes(row, true)),
-            });
-        }
     }
     output
 }
@@ -344,7 +336,7 @@ mod tests {
         assert!(!expanded[1].item.selectable());
     }
     #[test]
-    fn straight_history_has_continuous_rails_between_nodes() {
+    fn straight_history_uses_metadata_rows_as_continuous_rails() {
         let first = GraphRow {
             lanes: "* ".into(),
             sha: "a".into(),
@@ -357,8 +349,8 @@ mod tests {
             ..Default::default()
         };
         let rows = project(&[first, second], &[], 42);
-        assert_eq!(rows.len(), 5);
-        assert_eq!(rows[2].item, Item::Connector);
-        assert_eq!(rows[2].line.to_string(), "│ ");
+        assert_eq!(rows.len(), 4);
+        assert!(!rows.iter().any(|row| row.item == Item::Connector));
+        assert!(rows[1].line.to_string().starts_with("│ "));
     }
 }
