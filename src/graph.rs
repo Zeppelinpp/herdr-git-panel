@@ -402,9 +402,9 @@ fn label(row: &GraphRow, width: usize) -> Option<String> {
 fn commit_line(row: &GraphRow, geometry: &Geometry, expanded: bool, width: usize) -> Line<'static> {
     let mut spans = geometry.spans(false);
     let prefix = geometry.width();
-    let available = width.saturating_sub(prefix + 3);
+    let available = width.saturating_sub(prefix + 2);
     spans.push(Span::styled(
-        if expanded { " ▾ " } else { " › " },
+        if expanded { "▾ " } else { "› " },
         Style::new().fg(Color::Gray),
     ));
     let subject = visible(&row.subject);
@@ -425,8 +425,8 @@ fn commit_line(row: &GraphRow, geometry: &Geometry, expanded: bool, width: usize
 }
 fn detail_line(geometry: &Geometry, text: &str, width: usize) -> Line<'static> {
     let mut spans = geometry.spans(true);
-    spans.push(Span::raw("   "));
-    let available = width.saturating_sub(geometry.width() + 3);
+    spans.push(Span::raw("  "));
+    let available = width.saturating_sub(geometry.width() + 2);
     spans.push(Span::styled(
         truncate(text, available),
         Style::new().fg(Color::Gray),
@@ -484,13 +484,13 @@ pub fn project(rows: &[GraphRow], expanded: &[Expanded<'_>], width: usize) -> Ve
             });
             for (file_index, file) in detail.files.iter().enumerate() {
                 let mut spans = geometry.spans(true);
-                spans.push(Span::raw("   "));
+                spans.push(Span::raw("  "));
                 let stats = if file.added == "-" {
                     "binary".to_string()
                 } else {
                     format!("+{} -{}", file.added, file.deleted)
                 };
-                let budget = width.saturating_sub(geometry.width() + 3);
+                let budget = width.saturating_sub(geometry.width() + 2);
                 let path = truncate(&visible(&file.path), budget.saturating_sub(stats.len() + 2));
                 spans.push(Span::raw(path));
                 spans.push(Span::raw("  "));
@@ -577,10 +577,7 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[3].item, Item::File(0, 0));
         assert!(rows[0].line.to_string().contains('▾'));
-        assert_eq!(
-            rows[1].line.to_string(),
-            "│ │    Alice · 2025-10-29 | 10:38"
-        );
+        assert_eq!(rows[1].line.to_string(), "│ │   Alice · 2025-10-29 | 10:38");
         assert!(rows[2].line.to_string().starts_with("│ │"));
         assert_eq!(rows[3].line.spans[2].style.fg, Some(Color::Yellow));
         assert!(rows[3].line.to_string().contains("+12 -3"));
