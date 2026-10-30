@@ -433,6 +433,8 @@ pub fn toggle() -> Result<()> {
         repo.path.to_str().context("Non-UTF8 repository path")?,
         "--env",
         &format!("GIT_PANEL_REPO={}", repo.path.display()),
+        "--env",
+        &format!("GIT_PANEL_SOURCE_PANE={pane}"),
         "--focus",
     ])?;
     Ok(())

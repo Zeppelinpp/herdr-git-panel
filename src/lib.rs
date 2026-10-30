@@ -1,5 +1,6 @@
 mod diff;
 mod diff_view;
+mod follow;
 pub mod git;
 pub mod graph;
 mod history;

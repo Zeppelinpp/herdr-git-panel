@@ -61,6 +61,9 @@ esac
             assert!(arguments
                 .windows(2)
                 .any(|pair| pair == ["--direction", direction]));
+            assert!(arguments
+                .windows(2)
+                .any(|pair| { pair == ["--env", "GIT_PANEL_SOURCE_PANE=w1:p1"] }));
         } else {
             assert!(!output.status.success());
             assert!(

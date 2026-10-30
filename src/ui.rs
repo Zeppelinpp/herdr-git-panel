@@ -26,7 +26,9 @@ use ratatui::{
     DefaultTerminal, Frame, Terminal,
 };
 use std::{
+    collections::HashMap,
     env, io,
+    path::PathBuf,
     process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender, SyncSender},
     thread::{self, JoinHandle},
@@ -2272,36 +2274,49 @@ pub fn run(repo: Repo, cfg: Config) -> Result<()> {
     let (mut terminal, _guard) = terminal()?;
     let events = crate::runtime::Events::start()?;
     panel.wake = Some(events.waker());
-    let watch = if !panel.cfg.auto_refresh {
-        None
-    } else {
-        match RepoWatch::start(&panel.repo, events.waker()) {
-            Ok(watch) => Some(watch),
-            Err(error) => {
-                panel.watch_notice = Some(format!(
-                    "Auto refresh unavailable: {error:#}; Ctrl+R to refresh"
-                ));
-                None
-            }
-        }
-    };
+    let follow = crate::follow::Follow::start(events.waker())?;
+    let mut pending_repo = None;
+    let mut drafts = HashMap::new();
+    let mut watch = panel.start_watch(events.waker());
     panel.refresh();
     loop {
-        panel.receive();
+        if let Some(repo) = follow.as_ref().and_then(|follow| follow.take_latest()) {
+            if repo.path != panel.repo.path || pending_repo.is_some() {
+                pending_repo = Some(repo);
+                // Deferred actions and confirmations belong to the old repository.
+                panel.pending_file_action = None;
+                panel.pending_activation = None;
+                panel.pending_refresh = false;
+                panel.dialog = None;
+            }
+        }
+        if pending_repo.is_some() {
+            panel.finish_before_switch();
+        } else {
+            panel.receive();
+        }
+        if !panel.busy() {
+            if let Some(repo) = pending_repo.take() {
+                if panel.repo.path != repo.path {
+                    panel.switch_repo(repo, &mut drafts);
+                    watch = panel.start_watch(events.waker());
+                    panel.refresh();
+                }
+            }
+        }
         if let Some(watch) = &watch {
             if let Some(warning) = watch.warning() {
                 panel.watch_notice = Some(warning);
                 panel.dirty = true;
             }
-            if !panel.busy() && panel.dialog.is_none() {
+            if pending_repo.is_none() && !panel.busy() && panel.dialog.is_none() {
                 if let Some(changes) = watch.take_ready(Instant::now()) {
                     panel.auto_refresh(changes);
                 }
             }
         }
         panel.draw_pending(&mut terminal)?;
-        // Deadlines exist only while repository events or a new file selection
-        // settle. An idle panel blocks until input, notification or completion.
+        // Only pending filesystem batches and preview selections need deadlines.
         let watch_timeout = if panel.busy() || panel.dialog.is_some() {
             None
         } else {
@@ -2314,6 +2329,10 @@ pub fn run(repo: Repo, cfg: Config) -> Result<()> {
         let Some(event) = events.next(timeout)? else {
             continue;
         };
+        if pending_repo.is_some() {
+            // Finish any already running operation before accepting new input.
+            continue;
+        }
         match panel.handle_event(event) {
             Ok(true) => break,
             Err(error) => {
@@ -2327,6 +2346,50 @@ pub fn run(repo: Repo, cfg: Config) -> Result<()> {
         let _ = worker.join();
     }
     Ok(())
+}
+
+type Drafts = HashMap<PathBuf, (TextArea<'static>, TextArea<'static>, bool)>;
+
+impl Panel {
+    fn finish_before_switch(&mut self) {
+        // Let active Git operations finish, but never apply their old snapshot
+        // or open their deferred popup after a new repository was requested.
+        if self.receiver.try_recv().is_ok() {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn switch_repo(&mut self, repo: Repo, drafts: &mut Drafts) {
+        debug_assert!(!self.busy());
+        let mut next = Self::new(repo, self.cfg.clone());
+        next.theme = self.theme.clone();
+        next.wake = self.wake.clone();
+        if let Some((title, description, stage)) = drafts.remove(&next.repo.path) {
+            next.title = title;
+            next.description = description;
+            next.stage = stage;
+        }
+        let old = std::mem::replace(self, next);
+        drafts.insert(old.repo.path, (old.title, old.description, old.stage));
+    }
+
+    fn start_watch(&mut self, wake: SyncSender<()>) -> Option<RepoWatch> {
+        if !self.cfg.auto_refresh {
+            None
+        } else {
+            match RepoWatch::start(&self.repo, wake) {
+                Ok(watch) => Some(watch),
+                Err(error) => {
+                    self.watch_notice = Some(format!(
+                        "Auto refresh unavailable: {error:#}; Ctrl+R to refresh"
+                    ));
+                    None
+                }
+            }
+        }
+    }
 }
 pub fn run_diff(data: DiffData) -> Result<()> {
     let theme = Theme::load()?;
@@ -2379,6 +2442,60 @@ mod tests {
     use crate::git::GraphRow;
     use crate::graph;
     use ratatui::{backend::TestBackend, Terminal};
+    #[test]
+    fn switching_waits_for_worker_and_discards_its_old_result() {
+        let mut panel = fixture();
+        let (release, wait) = mpsc::channel();
+        let sender = panel.sender.clone();
+        panel.worker = Some(thread::spawn(move || {
+            wait.recv().unwrap();
+            sender
+                .send(Ok(Update::Committed("old commit result".into())))
+                .unwrap();
+        }));
+        panel.finish_before_switch();
+        assert!(panel.busy());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while panel.busy() {
+            assert!(Instant::now() < deadline);
+            panel.finish_before_switch();
+            thread::yield_now();
+        }
+        assert!(panel.message.is_empty());
+        assert!(panel.refresh_notice.is_none());
+    }
+    #[test]
+    fn repository_switch_resets_views_and_keeps_each_repositories_draft() {
+        let mut panel = fixture();
+        let original = panel.repo.clone();
+        panel.title.insert_str("original draft");
+        panel.description.insert_str("original description");
+        panel.last_mr = "old merge request".into();
+        let mut drafts = Drafts::new();
+        panel.switch_repo(
+            Repo {
+                path: PathBuf::from("/linked"),
+            },
+            &mut drafts,
+        );
+        assert_eq!(panel.repo.path, PathBuf::from("/linked"));
+        assert!(panel.snapshot.is_none());
+        assert!(panel.preview.wait(Instant::now()).is_none());
+        assert!(panel.last_mr.is_empty());
+        assert!(text(&panel.title).is_empty());
+        panel.title.insert_str("linked draft");
+        panel.switch_repo(original, &mut drafts);
+        assert_eq!(text(&panel.title), "original draft");
+        assert_eq!(text(&panel.description), "original description");
+        panel.switch_repo(
+            Repo {
+                path: PathBuf::from("/linked"),
+            },
+            &mut drafts,
+        );
+        assert_eq!(text(&panel.title), "linked draft");
+    }
     #[test]
     fn focused_commit_inputs_have_a_visible_cursor_with_and_without_text() {
         for focus in [Focus::Title, Focus::Description] {

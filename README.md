@@ -13,6 +13,7 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 - **Create PR/MR:** choose the remote, source branch, target branch, title and description. After creation, a clickable `!MR number ↗` link appears beside Create PR/MR. The action buttons size to their text and move the PR/MR button and link onto a second row when space is limited. Push the source branch before creating the request.
 - **Push:** push the current branch to the destination derived from the comparison branch. A confirmation shows the destination before pushing.
 - **Automatic refresh:** local file and Git changes update the panel while preserving your draft, selection and expanded commits.
+- **Follow worktrees:** the panel follows the last focused terminal in its tab when its working directory changes to another repository or worktree. Commit drafts are kept separately for each repository path.
 
 ### Panel preview
 
