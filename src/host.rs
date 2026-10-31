@@ -413,8 +413,13 @@ pub fn toggle() -> Result<()> {
         .or_else(|| ctx.get("focused_pane_cwd").and_then(Value::as_str))
         .or_else(|| current.get("cwd").and_then(Value::as_str))
         .context("No repository working directory")?;
+    open_panel(pane, cwd, true)
+}
+
+fn open_panel(pane: &str, cwd: &str, focus: bool) -> Result<()> {
     let repo = Repo::discover(cwd)?;
     let config = Config::load()?;
+    let focus = if focus { "--focus" } else { "--no-focus" };
     cli(&[
         "plugin",
         "pane",
@@ -435,9 +440,55 @@ pub fn toggle() -> Result<()> {
         &format!("GIT_PANEL_REPO={}", repo.path.display()),
         "--env",
         &format!("GIT_PANEL_SOURCE_PANE={pane}"),
-        "--focus",
+        focus,
     ])?;
     Ok(())
+}
+
+pub fn auto_open() -> Result<()> {
+    if env::var("HERDR_ENV").as_deref() != Ok("1") {
+        bail!("Run this event inside Herdr");
+    }
+    let event: Value = serde_json::from_str(
+        &env::var("HERDR_PLUGIN_EVENT_JSON").context("No worktree event context")?,
+    )?;
+    let data = event.get("data").context("Missing Herdr event data")?;
+    // Opening an already-live workspace is a focus request. Do not resurrect a
+    // panel that the user closed there.
+    if data.get("already_open").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let workspace = data.get("workspace").context("Missing Herdr workspace")?;
+    let workspace_id = field(workspace, "workspace_id")?;
+    let cwd = workspace
+        .get("worktree")
+        .and_then(|worktree| worktree.get("checkout_path"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            data.get("worktree")
+                .and_then(|worktree| worktree.get("path"))
+                .and_then(Value::as_str)
+        })
+        .context("No worktree checkout path")?;
+    let panes = cli(&["pane", "list", "--workspace", workspace_id])?;
+    let candidates = panes["panes"].as_array().context("No pane listing")?;
+    for candidate in candidates {
+        let id = field(candidate, "pane_id")?;
+        let info = cli(&["pane", "process-info", "--pane", id])?;
+        let processes = info["process_info"]["foreground_processes"]
+            .as_array()
+            .context("No process listing")?;
+        if processes.iter().any(owns_process) {
+            return Ok(());
+        }
+    }
+    let pane = field(
+        candidates
+            .first()
+            .context("No pane to attach to in worktree")?,
+        "pane_id",
+    )?;
+    open_panel(pane, cwd, false)
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DiffData {

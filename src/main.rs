@@ -11,6 +11,7 @@ fn run() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("panel") {
         "toggle" => host::toggle(),
+        "auto-open" => host::auto_open(),
         "setup" => host::setup(),
         "diff" => ui::run_diff(host::take_diff()?),
         "panel" => {
@@ -47,7 +48,7 @@ fn run() -> Result<()> {
             ui::run(repo, host::Config::load()?)
         }
         "--help" | "-h" => {
-            println!("herdr-git-panel [panel [--repo PATH] | toggle | diff | setup]");
+            println!("herdr-git-panel [panel [--repo PATH] | toggle | auto-open | diff | setup]");
             Ok(())
         }
         other => bail!("Unknown command: {other}"),

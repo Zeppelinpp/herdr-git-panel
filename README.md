@@ -14,6 +14,7 @@ A Git sidebar for [Herdr](https://herdr.dev), with searchable branches, commit h
 - **Push:** push the current branch to the destination derived from the comparison branch. A confirmation shows the destination before pushing.
 - **Automatic refresh:** local file and Git changes update the panel while preserving your draft, selection and expanded commits.
 - **Follow worktrees:** the panel follows the last focused terminal in its tab when its working directory changes to another repository or worktree. Commit drafts are kept separately for each repository path.
+- **Open with worktrees:** creating or opening a worktree workspace opens the panel beside its first pane without taking focus. Reopening a live workspace does not reopen a panel you closed.
 
 ### Panel preview
 
