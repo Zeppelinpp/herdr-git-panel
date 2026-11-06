@@ -254,10 +254,6 @@ impl Preview {
         self.viewer.as_ref().is_some_and(Viewer::review_active)
     }
 
-    pub(crate) fn mouse_captured(&self) -> bool {
-        self.viewer.as_ref().is_some_and(Viewer::mouse_captured)
-    }
-
     pub(crate) fn mouse(&mut self, mouse: MouseEvent) {
         if let Some(viewer) = &mut self.viewer {
             viewer.mouse(mouse);

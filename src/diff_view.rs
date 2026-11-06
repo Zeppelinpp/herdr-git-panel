@@ -71,7 +71,6 @@ pub(crate) struct Viewer {
     wake: Option<SyncSender<()>>,
     patch_identity: (usize, u64),
     selection: Option<usize>,
-    drag_start: Option<usize>,
     delivery: Option<Delivery>,
 }
 
@@ -91,13 +90,12 @@ impl Viewer {
             pending: None,
             wake,
             selection: None,
-            drag_start: None,
             delivery: None,
         }
     }
 
     pub(crate) fn review_active(&self) -> bool {
-        self.selection.is_some() || self.delivery.is_some() || self.drag_start.is_some()
+        self.selection.is_some() || self.delivery.is_some()
     }
 
     /// Embedded navigation may leave the diff only after reaching a boundary.
@@ -135,10 +133,6 @@ impl Viewer {
         if let Some(delivery) = &mut self.delivery {
             delivery.hide();
         }
-    }
-
-    pub(crate) fn mouse_captured(&self) -> bool {
-        self.drag_start.is_some()
     }
 
     fn selected_payload(&self) -> std::result::Result<String, String> {
@@ -357,13 +351,11 @@ impl Viewer {
             }
             return false;
         }
-        self.drag_start = None;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 if self.selection.take().is_none() {
                     return true;
                 }
-                self.drag_start = None;
             }
             KeyCode::Char('v') => {
                 self.selection = if self.selection.is_some() {
@@ -371,7 +363,6 @@ impl Viewer {
                 } else {
                     Some(self.cursor)
                 };
-                self.drag_start = None;
             }
             KeyCode::Char('p') => self.open_delivery(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
@@ -418,7 +409,6 @@ impl Viewer {
             }
             KeyCode::Char('r') => {
                 self.selection = None;
-                self.drag_start = None;
                 self.pending = None;
                 self.start(true);
             }
@@ -431,20 +421,6 @@ impl Viewer {
     pub(crate) fn mouse(&mut self, mouse: MouseEvent) {
         if let Some(delivery) = &mut self.delivery {
             delivery.mouse(mouse);
-            return;
-        }
-        if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
-            if self.drag_start.is_some_and(|start| {
-                self.selection.is_some()
-                    || start != self.top + usize::from(mouse.row.saturating_sub(self.body.y))
-            }) {
-                self.extend_drag(mouse.row);
-            }
-            self.drag_start = None;
-            return;
-        }
-        if mouse.kind == MouseEventKind::Drag(MouseButton::Left) && self.drag_start.is_some() {
-            self.extend_drag(mouse.row);
             return;
         }
         if !self.body.contains((mouse.column, mouse.row).into()) {
@@ -472,7 +448,6 @@ impl Viewer {
                     } else {
                         self.selection = None;
                     }
-                    self.drag_start = Some(self.selection.unwrap_or(self.cursor));
                 }
                 let bottom = mouse.column >= self.body.x + self.body.width / 2;
                 if self.doc.is_fold(self.cursor) && !self.review_active() {
@@ -481,24 +456,6 @@ impl Viewer {
             }
             _ => (),
         }
-        self.clamp();
-    }
-
-    fn extend_drag(&mut self, row: u16) {
-        if self.body.height == 0 {
-            return;
-        }
-        self.selection = self.drag_start;
-        if row < self.body.y {
-            self.top = self.top.saturating_sub(1);
-        } else if row >= self.body.bottom() {
-            self.top = self
-                .top
-                .saturating_add(1)
-                .min(self.doc.len().saturating_sub(usize::from(self.body.height)));
-        }
-        self.cursor =
-            self.top + usize::from(row.saturating_sub(self.body.y).min(self.body.height - 1));
         self.clamp();
     }
 
@@ -618,11 +575,6 @@ mod tests {
         assert!(!viewer.at_navigation_edge(true));
         assert!(!viewer.at_navigation_edge(false));
         viewer.key(KeyEvent::from(KeyCode::Esc));
-        assert!(viewer.at_navigation_edge(true));
-
-        viewer.drag_start = Some(viewer.cursor);
-        assert!(!viewer.at_navigation_edge(true));
-        viewer.drag_start = None;
         assert!(viewer.at_navigation_edge(true));
     }
 
@@ -877,50 +829,42 @@ mod tests {
     }
 
     #[test]
-    fn mouse_drag_and_shift_click_select_source_rows_without_expanding_them() {
+    fn click_moves_cursor_and_shift_click_selects_source_rows_without_expanding_them() {
         let mut viewer = fixture();
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         draw(&mut viewer, &mut terminal);
         let start = viewer.doc.row_for_source(Some(31), None).unwrap();
         let y = viewer.body.y + (start - viewer.top) as u16;
-        let mouse = |kind, row, modifiers| MouseEvent {
-            kind,
+        let rows_before = viewer.doc.len();
+        let click = |row, modifiers| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
             column: 30,
             row,
             modifiers,
         };
-        viewer.mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            y,
-            KeyModifiers::NONE,
-        ));
-        assert!(viewer.mouse_captured());
-        viewer.mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            y + 1,
-            KeyModifiers::NONE,
-        ));
-        viewer.mouse(mouse(
-            MouseEventKind::Up(MouseButton::Left),
-            y + 2,
-            KeyModifiers::NONE,
-        ));
+
+        viewer.mouse(click(y, KeyModifiers::NONE));
+        assert_eq!(viewer.cursor, start);
+        assert_eq!(viewer.selection, None);
+        assert!(!viewer.review_active());
+
+        viewer.mouse(click(y + 2, KeyModifiers::SHIFT));
         assert_eq!(viewer.selection, Some(start));
         assert_eq!(viewer.cursor, start + 2);
-        assert!(!viewer.mouse_captured());
-        viewer.mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            y + 2,
-            KeyModifiers::SHIFT,
-        ));
-        viewer.mouse(mouse(
-            MouseEventKind::Drag(MouseButton::Left),
-            y + 3,
-            KeyModifiers::SHIFT,
-        ));
+        assert!(viewer.review_active());
+
+        viewer.mouse(click(y + 3, KeyModifiers::SHIFT));
         assert_eq!(viewer.selection, Some(start));
+        assert_eq!(viewer.cursor, start + 3);
         let text = viewer.doc.selected_patch(start, viewer.cursor).unwrap();
         assert!(text.contains("+new31") && text.contains("line33"));
+        assert_eq!(viewer.doc.len(), rows_before);
+        assert!(viewer.loading.is_none());
+
+        viewer.mouse(click(y + 1, KeyModifiers::NONE));
+        assert_eq!(viewer.cursor, start + 1);
+        assert_eq!(viewer.selection, None);
+        assert!(!viewer.review_active());
     }
 
     #[test]

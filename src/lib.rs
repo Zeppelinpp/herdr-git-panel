@@ -12,3 +12,4 @@ pub mod ui;
 pub mod watch;
 
 mod runtime;
+mod text_selection;

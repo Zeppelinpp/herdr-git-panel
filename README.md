@@ -28,6 +28,7 @@ The panel combines branch selection, working-tree changes, commit controls, inli
 | Jump between focus areas | `Tab` / `Shift+Tab` |
 | Navigate rows and cross section boundaries | `j` / `k`, `↑` / `↓` |
 | Scroll within the hovered list | Mouse wheel |
+| Copy displayed text | Drag with the left mouse button; release to copy |
 | Stage / unstage the selected changed file | `Space` |
 | Discard all changes to the selected changed file | `d`, then `y` to confirm or `n` to cancel |
 | Expand a commit / focus the selected diff | `Enter` |
@@ -79,8 +80,17 @@ Refresh restores the selected source line when it still exists. Inserted/deleted
 lines follow Herdr's theme, with bounded inline emphasis for edited portions of
 paired lines.
 
-In either diff view, press `v` and move with arrows or `j` / `k` to select lines.
-Mouse drag and Shift-click also select a range. Press `p` to choose an idle or done
+Drag with the left mouse button anywhere in the panel or diff popup to select
+displayed text; releasing copies it without holding Shift. This copies the visible
+characters, including line numbers and borders within the selection. Clicks activate
+on release, and the mouse wheel still scrolls. The view stays fixed during a drag;
+`Esc` cancels it and resizing clears it. Clipboard writes use OSC 52 through Herdr
+to the hosting terminal (also over SSH), so that terminal must allow clipboard writes.
+Selections above 192 KiB of UTF-8 text are rejected without changing the clipboard.
+
+In either diff view, press `v` and move with arrows or `j` / `k` to select source lines
+for an agent. Shift-click can also extend that range when the terminal forwards it.
+Press `p` to choose an idle or done
 agent in the current workspace, then `Enter` or **Send** to paste the selection
 into its input. Review or edit it there and press Enter to submit. The text includes
 the repository, file, comparison, old/new line numbers and complete selected lines.

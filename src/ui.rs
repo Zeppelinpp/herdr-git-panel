@@ -4,6 +4,7 @@ use crate::{
     history::{Action as HistoryAction, History, Identity as GraphSelection, RowHit},
     host::{self, Config, DiffData},
     preview::{Preview, Request as PreviewRequest, MIN_HEIGHT as MIN_PREVIEW_HEIGHT},
+    text_selection::{self, MouseAction, TextSelection},
     theme::{Theme, INPUT_CURSOR, NAVIGATION},
     watch::{Changes, RepoWatch},
 };
@@ -228,6 +229,7 @@ pub struct Panel {
     wake: Option<SyncSender<()>>,
     watch_notice: Option<String>,
     dirty: bool,
+    text_selection: TextSelection,
 }
 fn textarea(value: &str) -> TextArea<'static> {
     let mut area = TextArea::from(value.lines().map(str::to_string).collect::<Vec<_>>());
@@ -366,6 +368,7 @@ impl Panel {
             wake: None,
             watch_notice: None,
             dirty: true,
+            text_selection: TextSelection::default(),
         }
     }
     fn busy(&self) -> bool {
@@ -1336,8 +1339,7 @@ impl Panel {
     fn mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         if self.dialog.is_none()
             && (self.preview_area.contains((mouse.column, mouse.row).into())
-                || self.preview.captures_input()
-                || self.preview.mouse_captured())
+                || self.preview.captures_input())
         {
             if self.preview.available() {
                 self.focus = Focus::Diff;
@@ -1506,9 +1508,21 @@ impl Panel {
         Ok(true)
     }
     fn handle_event(&mut self, event: Event) -> Result<bool> {
+        self.handle_event_with_clipboard(event, io::stdout().lock())
+    }
+    fn handle_event_with_clipboard(
+        &mut self,
+        event: Event,
+        clipboard: impl io::Write,
+    ) -> Result<bool> {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 self.dirty = true;
+                let selecting = self.text_selection.active();
+                self.text_selection.cancel();
+                if selecting && key.code == KeyCode::Esc {
+                    return Ok(false);
+                }
                 return self.key(key);
             }
             Event::Mouse(mouse)
@@ -1522,10 +1536,19 @@ impl Panel {
                 ) =>
             {
                 self.dirty = true;
-                self.mouse(mouse)?;
+                match self.text_selection.mouse(mouse) {
+                    MouseAction::Pending => (),
+                    MouseAction::Click(press, release) => {
+                        self.mouse(press)?;
+                        self.mouse(release)?;
+                    }
+                    MouseAction::Copy(text) => text_selection::copy(&text, clipboard)?,
+                    MouseAction::Forward(mouse) => self.mouse(mouse)?,
+                }
             }
             Event::Paste(value) => {
                 self.dirty = true;
+                self.text_selection.cancel();
                 if let Some(dialog) = &mut self.dialog {
                     match dialog {
                         Dialog::Branches(b) => {
@@ -1549,12 +1572,26 @@ impl Panel {
                     }
                 }
             }
-            Event::Resize(_, _) | Event::FocusGained => self.dirty = true,
+            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {
+                self.text_selection.cancel();
+                self.dirty = true;
+            }
             _ => (),
         }
         Ok(false)
     }
     pub fn render(&mut self, frame: &mut Frame) {
+        let style = Style::new()
+            .fg(self.theme.text)
+            .bg(self.theme.selection)
+            .remove_modifier(Modifier::REVERSED);
+        if self.text_selection.render(frame.buffer_mut(), style) {
+            return;
+        }
+        self.render_contents(frame);
+        self.text_selection.capture(frame.buffer_mut());
+    }
+    fn render_contents(&mut self, frame: &mut Frame) {
         self.discard_visible = false;
         if !self.can_focus(self.focus) {
             self.change_focus(false);
@@ -2280,38 +2317,41 @@ pub fn run(repo: Repo, cfg: Config) -> Result<()> {
     let mut watch = panel.start_watch(events.waker());
     panel.refresh();
     loop {
-        if let Some(repo) = follow.as_ref().and_then(|follow| follow.take_latest()) {
-            if repo.path != panel.repo.path || pending_repo.is_some() {
-                pending_repo = Some(repo);
-                // Deferred actions and confirmations belong to the old repository.
-                panel.pending_file_action = None;
-                panel.pending_activation = None;
-                panel.pending_refresh = false;
-                panel.dialog = None;
-            }
-        }
-        if pending_repo.is_some() {
-            panel.finish_before_switch();
-        } else {
-            panel.receive();
-        }
-        if !panel.busy() {
-            if let Some(repo) = pending_repo.take() {
-                if panel.repo.path != repo.path {
-                    panel.switch_repo(repo, &mut drafts);
-                    watch = panel.start_watch(events.waker());
-                    panel.refresh();
+        // Keep displayed text and click targets stable until the gesture ends.
+        if !panel.text_selection.active() {
+            if let Some(repo) = follow.as_ref().and_then(|follow| follow.take_latest()) {
+                if repo.path != panel.repo.path || pending_repo.is_some() {
+                    pending_repo = Some(repo);
+                    // Deferred actions and confirmations belong to the old repository.
+                    panel.pending_file_action = None;
+                    panel.pending_activation = None;
+                    panel.pending_refresh = false;
+                    panel.dialog = None;
                 }
             }
-        }
-        if let Some(watch) = &watch {
-            if let Some(warning) = watch.warning() {
-                panel.watch_notice = Some(warning);
-                panel.dirty = true;
+            if pending_repo.is_some() {
+                panel.finish_before_switch();
+            } else {
+                panel.receive();
             }
-            if pending_repo.is_none() && !panel.busy() && panel.dialog.is_none() {
-                if let Some(changes) = watch.take_ready(Instant::now()) {
-                    panel.auto_refresh(changes);
+            if !panel.busy() {
+                if let Some(repo) = pending_repo.take() {
+                    if panel.repo.path != repo.path {
+                        panel.switch_repo(repo, &mut drafts);
+                        watch = panel.start_watch(events.waker());
+                        panel.refresh();
+                    }
+                }
+            }
+            if let Some(watch) = &watch {
+                if let Some(warning) = watch.warning() {
+                    panel.watch_notice = Some(warning);
+                    panel.dirty = true;
+                }
+                if pending_repo.is_none() && !panel.busy() && panel.dialog.is_none() {
+                    if let Some(changes) = watch.take_ready(Instant::now()) {
+                        panel.auto_refresh(changes);
+                    }
                 }
             }
         }
@@ -2322,9 +2362,13 @@ pub fn run(repo: Repo, cfg: Config) -> Result<()> {
         } else {
             watch.as_ref().and_then(|w| w.wait(Instant::now()))
         };
-        let timeout = match (watch_timeout, panel.preview.wait(Instant::now())) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+        let timeout = if panel.text_selection.active() {
+            None
+        } else {
+            match (watch_timeout, panel.preview.wait(Instant::now())) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
         };
         let Some(event) = events.next(timeout)? else {
             continue;
@@ -2396,13 +2440,33 @@ pub fn run_diff(data: DiffData) -> Result<()> {
     let (mut terminal, _guard) = terminal()?;
     let events = crate::runtime::Events::start()?;
     let mut viewer = Viewer::new(data, Some(events.waker()));
+    let mut selection = TextSelection::default();
+    let mut copy_error: Option<String> = None;
     let mut dirty = true;
     loop {
-        dirty |= viewer.poll();
+        if !selection.active() {
+            dirty |= viewer.poll();
+        }
         if dirty {
             terminal.draw(|frame| {
+                let style = Style::new()
+                    .fg(theme.text)
+                    .bg(theme.selection)
+                    .remove_modifier(Modifier::REVERSED);
+                if selection.render(frame.buffer_mut(), style) {
+                    return;
+                }
                 viewer.render(frame, frame.area());
+                if let Some(error) = &copy_error {
+                    let area = frame.area();
+                    footer(
+                        frame,
+                        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+                        error,
+                    );
+                }
                 theme.apply(frame.buffer_mut());
+                selection.capture(frame.buffer_mut());
             })?;
             dirty = false;
         }
@@ -2411,6 +2475,13 @@ pub fn run_diff(data: DiffData) -> Result<()> {
         };
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
+                let selecting = selection.active();
+                selection.cancel();
+                copy_error = None;
+                if selecting && key.code == KeyCode::Esc {
+                    dirty = true;
+                    continue;
+                }
                 if viewer.key(key) {
                     break;
                 }
@@ -2426,10 +2497,25 @@ pub fn run_diff(data: DiffData) -> Result<()> {
                         | MouseEventKind::Up(MouseButton::Left)
                 ) =>
             {
-                viewer.mouse(mouse);
+                match selection.mouse(mouse) {
+                    MouseAction::Pending => (),
+                    MouseAction::Click(press, release) => {
+                        viewer.mouse(press);
+                        viewer.mouse(release);
+                    }
+                    MouseAction::Copy(text) => {
+                        copy_error = text_selection::copy(&text, io::stdout().lock())
+                            .err()
+                            .map(|error| error.to_string());
+                    }
+                    MouseAction::Forward(mouse) => viewer.mouse(mouse),
+                }
                 dirty = true;
             }
-            Event::Resize(_, _) | Event::FocusGained => dirty = true,
+            Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {
+                selection.cancel();
+                dirty = true;
+            }
             _ => (),
         }
     }
@@ -2442,6 +2528,94 @@ mod tests {
     use crate::git::GraphRow;
     use crate::graph;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn plain_drag_copies_visible_text_without_activating_the_control() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let mut panel = fixture();
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        panel.draw_pending(&mut terminal).unwrap();
+        let mut clipboard = Vec::new();
+        let mouse = |kind, column| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 0),
+            (MouseEventKind::Drag(MouseButton::Left), 6),
+        ] {
+            panel
+                .handle_event_with_clipboard(mouse(kind, column), &mut clipboard)
+                .unwrap();
+            panel.draw_pending(&mut terminal).unwrap();
+            assert!(
+                panel.dialog.is_none(),
+                "drag must not open the branch picker"
+            );
+            assert!(clipboard.is_empty(), "copy only on release");
+        }
+        panel
+            .handle_event_with_clipboard(
+                mouse(MouseEventKind::Up(MouseButton::Left), 6),
+                &mut clipboard,
+            )
+            .unwrap();
+        assert!(panel.dialog.is_none());
+        assert_eq!(
+            clipboard,
+            format!("\x1b]52;c;{}\x07", STANDARD.encode("Compare")).as_bytes()
+        );
+
+        panel
+            .handle_event_with_clipboard(
+                mouse(MouseEventKind::Down(MouseButton::Left), 0),
+                &mut clipboard,
+            )
+            .unwrap();
+        assert!(panel.dialog.is_none());
+        panel
+            .handle_event_with_clipboard(
+                mouse(MouseEventKind::Up(MouseButton::Left), 0),
+                &mut clipboard,
+            )
+            .unwrap();
+        assert!(matches!(panel.dialog, Some(Dialog::Branches(_))));
+    }
+
+    #[test]
+    fn escape_cancels_drag_without_copying_or_closing_panel() {
+        let mut panel = fixture();
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        panel.draw_pending(&mut terminal).unwrap();
+        let mut clipboard = Vec::new();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            panel
+                .handle_event_with_clipboard(
+                    Event::Mouse(MouseEvent {
+                        kind,
+                        column: 5,
+                        row: 1,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                    &mut clipboard,
+                )
+                .unwrap();
+        }
+        assert!(!panel
+            .handle_event_with_clipboard(Event::Key(KeyEvent::from(KeyCode::Esc)), &mut clipboard)
+            .unwrap());
+        assert!(!panel.text_selection.active());
+        assert!(clipboard.is_empty());
+        assert!(panel.dialog.is_none());
+    }
     #[test]
     fn switching_waits_for_worker_and_discards_its_old_result() {
         let mut panel = fixture();
@@ -2569,7 +2743,12 @@ mod tests {
             } else {
                 Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             };
-            panel.handle_event(event).unwrap();
+            panel.handle_event(event.clone()).unwrap();
+            if let Event::Mouse(mut mouse) = event {
+                assert_eq!(panel.focus, Focus::HistoryToggle);
+                mouse.kind = MouseEventKind::Up(MouseButton::Left);
+                panel.handle_event(Event::Mouse(mouse)).unwrap();
+            }
             panel.draw_pending(&mut terminal).unwrap();
             assert_eq!(
                 panel.focus,
@@ -3553,6 +3732,14 @@ mod tests {
         panel
             .handle_event(Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+        panel
+            .handle_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
                 column: rect.x,
                 row: rect.y,
                 modifiers: KeyModifiers::NONE,
