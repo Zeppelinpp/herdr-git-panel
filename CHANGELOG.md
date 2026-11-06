@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.5] - 2026-11-06
+
+### Added
+
+- Drag with the left mouse button to copy visible text from the panel or diff popup on release, without holding Shift. Selection handles Unicode and multiple lines, keeps the displayed snapshot stable, and uses OSC 52 to reach the hosting terminal's clipboard, including over SSH.
+- Open the Git panel automatically when creating or opening a worktree workspace, without taking focus.
+
+### Changed
+
+- Activate clicked controls on mouse release so dragging from a button, branch or commit does not trigger it. Use `v` and keyboard navigation to select source lines for `p` agent delivery; Shift-click remains available when forwarded by the terminal.
+
+### Fixed
+
+- Follow the sibling terminal's current repository and worktree while preserving separate commit drafts and rejecting stale updates.
+- Tighten spacing between commit metadata and expanded file rows in the history graph.
+
 ## [0.7.4] - 2026-10-29
 
 ### Added

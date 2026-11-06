@@ -125,7 +125,7 @@ Close and reopen an existing panel after updating.
 To install a specific published version:
 
 ```sh
-herdr plugin install Zeppelinpp/herdr-git-panel --ref v0.7.1
+herdr plugin install Zeppelinpp/herdr-git-panel --ref v0.7.5
 ```
 
 `plugin update` follows the installation's saved source/ref. A version pinned with
