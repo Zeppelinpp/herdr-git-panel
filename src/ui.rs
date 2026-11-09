@@ -237,6 +237,8 @@ fn textarea(value: &str) -> TextArea<'static> {
     area.set_cursor_line_style(NORMAL);
     area.set_selection_style(SELECTED);
     area.set_placeholder_style(DIM);
+    area.move_cursor(tui_textarea::CursorMove::Bottom);
+    area.move_cursor(tui_textarea::CursorMove::End);
     area
 }
 fn text(area: &TextArea<'_>) -> String {
@@ -986,15 +988,11 @@ impl Panel {
                     .push
                     .clone()
                     .unwrap_or((fallback, snapshot.base.clone()));
-                let mut source_input = textarea(&snapshot.branch);
-                source_input.move_cursor(tui_textarea::CursorMove::End);
-                let mut target_input = textarea(&target);
-                target_input.move_cursor(tui_textarea::CursorMove::End);
                 self.dialog = Some(Dialog::Mr(MrDialog {
                     fields: vec![
                         textarea(&remote),
-                        source_input,
-                        target_input,
+                        textarea(&snapshot.branch),
+                        textarea(&target),
                         textarea(&text(&self.title)),
                         textarea(&text(&self.description)),
                     ],
@@ -2534,7 +2532,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
-    fn mr_branch_fields_append_at_the_end_by_default() {
+    fn mr_prefilled_fields_append_at_the_end_by_default() {
         for push in [None, Some(("origin".into(), "release/目标".into()))] {
             let mut panel = fixture();
             let snapshot = panel.snapshot.as_mut().unwrap();
@@ -2546,21 +2544,36 @@ mod tests {
                 .as_ref()
                 .map_or(snapshot.base.as_str(), |(_, target)| target.as_str())
                 .to_string();
+            panel.title.insert_str("Existing title");
+            panel.description.insert_str("First line\n最后一行");
             panel.focus = Focus::Mr;
             panel.key(KeyEvent::from(KeyCode::Enter)).unwrap();
 
-            for (index, branch) in [(1, "feature/分支"), (2, target.as_str())] {
-                panel.key(KeyEvent::from(KeyCode::Tab)).unwrap();
+            let values = [
+                "origin",
+                "feature/分支",
+                target.as_str(),
+                "Existing title",
+                "First line\n最后一行",
+            ];
+            for (index, value) in values.into_iter().enumerate() {
+                if index > 0 {
+                    panel.key(KeyEvent::from(KeyCode::Tab)).unwrap();
+                }
                 let Some(Dialog::Mr(form)) = &panel.dialog else {
                     panic!("MR dialog must remain open");
                 };
                 assert_eq!(form.selected, index);
-                assert_eq!(form.fields[index].cursor(), (0, branch.chars().count()));
+                let lines: Vec<_> = value.lines().collect();
+                assert_eq!(
+                    form.fields[index].cursor(),
+                    (lines.len() - 1, lines.last().unwrap().chars().count())
+                );
                 panel.key(KeyEvent::from(KeyCode::Char('x'))).unwrap();
                 let Some(Dialog::Mr(form)) = &panel.dialog else {
                     panic!("MR dialog must remain open");
                 };
-                assert_eq!(text(&form.fields[index]), format!("{branch}x"));
+                assert_eq!(text(&form.fields[index]), format!("{value}x"));
             }
         }
     }
