@@ -102,6 +102,40 @@ updates. Selections are limited to 2,000 source lines and 128 KiB including cont
 information. After an unconfirmed delivery, inspect the target's input and press
 `r` in the picker to reload targets before retrying.
 
+### Codex thread titles in the agent sidebar
+
+Codex can publish its thread title through its own terminal. Herdr receives that
+title on the originating pane, so this works with Codex's shared daemon without
+session-to-pane hooks, screen scraping, or a polling plugin.
+
+In `~/.codex/config.toml`, add this setting to the existing `[tui]` table:
+
+```toml
+[tui]
+terminal_title = ["thread-title"]
+```
+
+`thread-title` is the value saved by Codex 0.166.0's **Thread title** picker.
+The footer's `status_line` is configured separately. In Herdr's `config.toml`,
+set the Codex rows in the existing agent layout:
+
+```toml
+[ui.sidebar.agents.rows_by_agent]
+codex = [
+  ["state_icon", "terminal_title_stripped"],
+  ["workspace", "tab"],
+  ["agent"],
+]
+```
+
+Run `herdr server reload-config` to apply the sidebar layout. New Codex terminals
+use the saved title setting; in an already-running terminal, use `/title` and
+select **Thread title** to apply it immediately. No shared-daemon or ChatGPT App
+restart is needed. Unnamed threads use their thread ID until a title is generated.
+Custom `$thread_title` reporting hooks can remain disabled with this layout.
+See the [Codex `/title` documentation](https://learn.chatgpt.com/docs/developer-commands)
+for the interactive title picker.
+
 ## Installation
 
 Requires **Herdr ≥0.9.5**, Git, and macOS or Linux. Creating requests also requires an authenticated `gh` for GitHub or `glab` for GitLab.
