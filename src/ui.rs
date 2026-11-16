@@ -20,10 +20,11 @@ use crossterm::{
 };
 use ratatui::{
     backend::Backend,
+    buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
     DefaultTerminal, Frame, Terminal,
 };
 use std::{
@@ -265,17 +266,68 @@ fn trim_output(value: &str) -> String {
         .join(" · ")
 }
 fn paint_input(frame: &mut Frame, area: Rect, input: &mut TextArea<'_>, title: &str, active: bool) {
-    input.set_block(
-        Block::bordered()
-            .title(title.to_string())
-            .border_style(if active {
-                BOLD
-            } else {
-                NORMAL.fg(Color::DarkGray)
-            }),
-    );
+    let block = Block::bordered()
+        .title(title.to_string())
+        .border_style(if active {
+            BOLD
+        } else {
+            NORMAL.fg(Color::DarkGray)
+        });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    input.remove_block();
     input.set_cursor_style(if active { INPUT_CURSOR } else { NORMAL });
-    frame.render_widget(&*input, area);
+
+    // tui-textarea 0.7 scrolls by character count, while ratatui scrolls by
+    // terminal columns. Render a wide viewport first so the editor retains its
+    // cursor, selection and vertical scrolling, then crop by display width.
+    let (row, col) = input.cursor();
+    let line = &input.lines()[row];
+    let mut prefix = String::new();
+    let mut columns = 0;
+    for ch in line.chars().take(col) {
+        if ch == '\t' {
+            let tab = usize::from(input.tab_length());
+            let spaces = if tab == 0 { 0 } else { tab - columns % tab };
+            prefix.extend(std::iter::repeat_n(' ', spaces));
+            columns += spaces;
+        } else {
+            prefix.push(ch);
+            columns += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    let cursor_col = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+    let cursor_width = line
+        .chars()
+        .nth(col)
+        .and_then(unicode_width::UnicodeWidthChar::width)
+        .unwrap_or(1)
+        .max(1);
+    let left = (cursor_col + cursor_width).saturating_sub(usize::from(inner.width));
+    let width = (left + usize::from(inner.width)).max(col + 1);
+    let viewport = Rect::new(0, 0, u16::try_from(width).unwrap_or(u16::MAX), inner.height);
+    let mut buffer = Buffer::empty(viewport);
+    (&*input).render(viewport, &mut buffer);
+    for y in 0..inner.height {
+        for x in 0..inner.width {
+            let source_x = left + usize::from(x);
+            let target = &mut frame.buffer_mut()[(inner.x + x, inner.y + y)];
+            if source_x < usize::from(viewport.width) {
+                let cell = &buffer[(source_x as u16, y)];
+                // A wide character at the right edge must not cover the border.
+                if unicode_width::UnicodeWidthStr::width(cell.symbol())
+                    <= usize::from(inner.width - x)
+                {
+                    *target = cell.clone();
+                    continue;
+                }
+            }
+            target.reset();
+        }
+    }
 }
 fn footer(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(Paragraph::new(text.to_string()).style(DIM), area);
@@ -2768,6 +2820,109 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn overflowing_commit_inputs_keep_the_cursor_and_latest_text_visible() {
+        for focus in [Focus::Title, Focus::Description] {
+            for value in ["long title ".repeat(10), "很长的提交说明".repeat(10)] {
+                let mut panel = fixture();
+                panel.focus = focus;
+                let mut terminal = Terminal::new(TestBackend::new(30, 40)).unwrap();
+                for ch in value.chars() {
+                    panel.key(KeyEvent::from(KeyCode::Char(ch))).unwrap();
+                    terminal.draw(|f| panel.render(f)).unwrap();
+                }
+                let buffer = terminal.draw(|f| panel.render(f)).unwrap().buffer.clone();
+                let rect = panel
+                    .hits
+                    .iter()
+                    .find(|(_, h)| matches!(h, Hit::Focus(f) if *f == focus))
+                    .unwrap()
+                    .0;
+                let cursor_x = (rect.x + 1..rect.right() - 1)
+                    .find(|&x| buffer[(x, rect.y + 1)].bg == panel.theme.accent)
+                    .unwrap_or_else(|| panic!("{focus:?}: cursor hidden for {value:?}"));
+                assert!(cursor_x > rect.x + 1);
+                assert_eq!(
+                    buffer[(cursor_x - if value.is_ascii() { 1 } else { 2 }, rect.y + 1)].symbol(),
+                    value.chars().last().unwrap().to_string(),
+                    "latest input must be visible before the cursor"
+                );
+            }
+        }
+    }
+    #[test]
+    fn input_viewport_follows_navigation_paste_and_resize() {
+        let mut input = textarea("");
+        input.insert_str(format!("first line\n{}结尾", "中文abc".repeat(20)));
+        for width in [30, 15, 40] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+            for key in [
+                KeyCode::End,
+                KeyCode::Left,
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Backspace,
+                KeyCode::Home,
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::End,
+            ] {
+                input.input(KeyEvent::from(key));
+                let frame = terminal
+                    .draw(|frame| paint_input(frame, frame.area(), &mut input, "Input", true))
+                    .unwrap();
+                let buffer = frame.buffer;
+                let (x, y) = (1..3)
+                    .flat_map(|y| (1..width - 1).map(move |x| (x, y)))
+                    .find(|&pos| buffer[pos].bg == Color::LightBlue)
+                    .unwrap_or_else(|| panic!("cursor hidden after {key:?} at width {width}"));
+                let (row, col) = input.cursor();
+                assert_eq!(
+                    buffer[(x, y)].symbol(),
+                    input.lines()[row]
+                        .chars()
+                        .nth(col)
+                        .unwrap_or(' ')
+                        .to_string()
+                );
+                if col > 0 {
+                    let previous = input.lines()[row].chars().nth(col - 1).unwrap();
+                    let char_width = unicode_width::UnicodeWidthChar::width(previous).unwrap();
+                    assert_eq!(
+                        buffer[(x - char_width as u16, y)].symbol(),
+                        previous.to_string()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_viewport_preserves_selection_for_wide_text() {
+        let mut input = textarea(&"中文".repeat(30));
+        input.move_cursor(tui_textarea::CursorMove::Back);
+        input.start_selection();
+        input.move_cursor(tui_textarea::CursorMove::Forward);
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        let frame = terminal
+            .draw(|frame| paint_input(frame, frame.area(), &mut input, "Input", true))
+            .unwrap();
+        assert_eq!(input.selection_range(), Some(((0, 59), (0, 60))));
+        assert!(frame
+            .buffer
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::LightBlue));
+        let frame = terminal
+            .draw(|frame| paint_input(frame, frame.area(), &mut input, "Input", false))
+            .unwrap();
+        assert!(frame
+            .buffer
+            .content
+            .iter()
+            .any(|cell| { cell.symbol() == "文" && cell.modifier.contains(Modifier::REVERSED) }));
+    }
+
     #[test]
     fn opening_history_routes_jk_to_commits_and_expanded_files() {
         for mouse in [false, true] {
