@@ -89,13 +89,13 @@ Working-tree notifications refresh working previews even if statistics match,
 while committed previews retain their snapshot. Same-content refreshes update
 worktree stamps and keep loaded context, folds and reading position.
 
-Review selection adds only range comparisons to viewport rendering. Export runs
-on demand, reads original selected rows (including full text beyond horizontal
-clipping), and stops at 2,000 source rows or 128 KiB. Hidden intervals remain
-explicit omissions. Target discovery and delivery run on background workers and
-wake the UI on completion. Discovery is requested only with `p` or explicit
-refresh, so there is no agent polling while browsing. A selection holds its diff
-snapshot until released; repository refresh reconciliation then resumes.
+Review selection adds only range comparisons to viewport rendering. Pressing `p`
+finds the selected range's first and last new-side line numbers without reading
+source text or expanding folded context. Target discovery and delivery run on
+background workers and wake the UI on completion. Discovery is requested only
+with `p` or explicit refresh, so there is no agent polling while browsing. A
+selection holds its diff snapshot until released; repository refresh
+reconciliation then resumes.
 
 A real 120×50 PTY check verifies that the initial inline preview appears without
 input, includes exactly five context lines on each side, expands missing content

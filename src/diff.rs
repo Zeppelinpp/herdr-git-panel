@@ -12,8 +12,6 @@ const EXPAND_LINES: usize = 20;
 const DEFAULT_CONTEXT_LINES: usize = 5;
 const EMPHASIS_LIMIT: usize = 4096;
 const NO_FINAL_NEWLINE: &str = " [no final newline]";
-pub(crate) const MAX_REVIEW_BYTES: usize = 128 * 1024;
-const REVIEW_MAX_LINES: usize = 2_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExpandResult {
@@ -463,81 +461,18 @@ impl Document {
         }
     }
 
-    /// Export selected display rows without display clipping or hidden source.
-    /// Fold rows remain explicit omissions; source lines retain both coordinates.
-    pub fn selected_patch(&self, start: usize, end: usize) -> Result<String, String> {
-        if self.is_empty() || start >= self.len || end >= self.len {
+    /// Map the selected display rows to their inclusive new-side line range.
+    pub fn selected_line_range(&self, start: usize, end: usize) -> Result<(usize, usize), String> {
+        if start >= self.len || end >= self.len {
             return Err("Select source lines from this diff before sending".into());
         }
-        let mut output = String::new();
-        let mut code_lines = 0;
-        for index in start.min(end)..=start.max(end) {
-            let projection = self
-                .locate(index)
-                .ok_or("Selected diff row is unavailable")?;
-            match (&self.blocks[projection.block], &projection.kind) {
-                (Block::Changes(lines), ProjectionKind::Changes) => {
-                    let code = &lines[index - projection.start];
-                    code_lines += 1;
-                    if code_lines > REVIEW_MAX_LINES {
-                        return Err(
-                            "Selection exceeds 2,000 source lines; select a smaller range".into(),
-                        );
-                    }
-                    append_review_line(
-                        &mut output,
-                        code.old,
-                        code.new,
-                        code.kind,
-                        &code.text,
-                        code.no_final_newline,
-                    )?;
-                }
-                (Block::Gap(gap), ProjectionKind::Context { start }) => {
-                    let offset = start + index - projection.start;
-                    let new = gap.new + offset;
-                    let text = self
-                        .context_line(new)
-                        .ok_or("Selected context is not loaded")?;
-                    code_lines += 1;
-                    if code_lines > REVIEW_MAX_LINES {
-                        return Err(
-                            "Selection exceeds 2,000 source lines; select a smaller range".into(),
-                        );
-                    }
-                    append_review_line(
-                        &mut output,
-                        Some(gap.old + offset),
-                        Some(new),
-                        Kind::Context,
-                        text,
-                        self.context_no_final_newline(new),
-                    )?;
-                }
-                (Block::Gap(gap), ProjectionKind::Fold) => {
-                    let old = gap.old + gap.top;
-                    let new = gap.new + gap.top;
-                    let omission = if let Some(len) = gap.len {
-                        let count = len.saturating_sub(gap.top + gap.bottom);
-                        format!(
-                            "… {count} unchanged lines omitted (old:{old}-{} new:{new}-{})\n",
-                            old + count.saturating_sub(1),
-                            new + count.saturating_sub(1),
-                        )
-                    } else {
-                        format!("… remaining unchanged lines omitted (old:{old}… new:{new}…)\n")
-                    };
-                    append_review(&mut output, &omission)?;
-                }
-                _ => (),
-            }
-        }
-        if code_lines == 0 {
-            return Err(
-                "Selection contains only folded context; select source lines before sending".into(),
-            );
-        }
-        Ok(output)
+        let mut lines = (start.min(end)..=start.max(end))
+            .filter(|&row| !self.is_fold(row))
+            .filter_map(|row| self.source_line(row)?.1);
+        let first = lines
+            .next()
+            .ok_or("Selection has no lines in the new file; select added or context lines")?;
+        Ok((first, lines.next_back().unwrap_or(first)))
     }
 
     pub fn row_for_source(&self, old: Option<usize>, new: Option<usize>) -> Option<usize> {
@@ -943,59 +878,6 @@ impl Document {
     }
 }
 
-fn append_review(output: &mut String, text: &str) -> Result<(), String> {
-    if text.len() > MAX_REVIEW_BYTES.saturating_sub(output.len()) {
-        return Err("Selection exceeds 128 KiB; select a smaller range".into());
-    }
-    output.push_str(text);
-    Ok(())
-}
-
-fn append_review_line(
-    output: &mut String,
-    old: Option<usize>,
-    new: Option<usize>,
-    kind: Kind,
-    text: &str,
-    no_final_newline: bool,
-) -> Result<(), String> {
-    let marker = match kind {
-        Kind::Context => ' ',
-        Kind::Delete => '-',
-        Kind::Insert => '+',
-    };
-    append_review(
-        output,
-        &format!(
-            "old:{} new:{} {marker}",
-            old.map_or_else(|| "-".into(), |line| line.to_string()),
-            new.map_or_else(|| "-".into(), |line| line.to_string()),
-        ),
-    )?;
-    // Reject oversized lines before scanning their text, and keep terminal
-    // controls inert while preserving actual tabs and Unicode source characters.
-    if text.len() > MAX_REVIEW_BYTES.saturating_sub(output.len()) {
-        return Err("Selection exceeds 128 KiB; select a smaller range".into());
-    }
-    if text.chars().any(|ch| ch.is_control() && ch != '\t') {
-        for ch in text.chars() {
-            if ch.is_control() && ch != '\t' {
-                for escaped in ch.escape_default() {
-                    append_review(output, escaped.encode_utf8(&mut [0; 4]))?;
-                }
-            } else {
-                append_review(output, ch.encode_utf8(&mut [0; 4]))?;
-            }
-        }
-    } else {
-        append_review(output, text)?;
-    }
-    if no_final_newline {
-        append_review(output, NO_FINAL_NEWLINE)?;
-    }
-    append_review(output, "\n")
-}
-
 fn parse_hunk(line: &str) -> Option<(usize, usize, usize, usize)> {
     let mut parts = line.strip_prefix("@@ -")?.split_whitespace();
     let old = parts.next()?;
@@ -1087,107 +969,30 @@ mod tests {
     }
 
     #[test]
-    fn selected_patch_preserves_both_sides_context_unicode_and_tabs() {
-        let document = Document::new("@@ -1,3 +1,3 @@\n before\n-old\t中文\n+new\t文字\n after\n");
-        let selected = document.selected_patch(0, 3).unwrap();
-        assert_eq!(
-            selected,
-            "old:1 new:1  before\nold:2 new:- -old\t中文\nold:- new:2 +new\t文字\nold:3 new:3  after\n"
-        );
-        assert_eq!(document.selected_patch(3, 0).unwrap(), selected);
-        assert!(document.line(2, 8, 20).width() <= 20);
-        assert!(document.selected_patch(2, 2).unwrap().contains("new\t文字"));
+    fn selected_line_range_uses_new_coordinates_with_deletions_and_context() {
+        let document = Document::new("@@ -1,4 +1,3 @@\n before\n-removed\n-old\n+new\n after\n");
+        assert_eq!(document.selected_line_range(1, 4).unwrap(), (2, 3));
+        assert_eq!(document.selected_line_range(4, 1).unwrap(), (2, 3));
+        assert_eq!(document.selected_line_range(3, 3).unwrap(), (2, 2));
+        assert!(document.selected_line_range(1, 2).is_err());
     }
 
     #[test]
-    fn selected_patch_reports_hidden_intervals_without_expanding_them() {
+    fn selected_line_range_uses_visible_endpoints_across_folded_context() {
         let document = Document::new(
             "@@ -1 +1 @@\n-old1\n+new1\n@@ -100000 +100000 @@\n-old_last\n+new_last\n",
         );
         let last = document.row_for_source(None, Some(100_000)).unwrap();
-        let selected = document.selected_patch(0, last).unwrap();
-        assert!(selected.contains("99998 unchanged lines omitted (old:2-99999 new:2-99999)"));
-        assert!(selected.contains("old:- new:100000 +new_last"));
-        assert!(selected.len() < 300);
-        let fold = (0..document.len())
-            .find(|row| document.is_fold(*row))
-            .unwrap();
-        assert!(document
-            .selected_patch(fold, fold)
-            .unwrap_err()
-            .contains("only folded"));
-        assert!(Document::new("").selected_patch(0, 0).is_err());
-        assert!(document.selected_patch(0, usize::MAX).is_err());
-    }
-
-    #[test]
-    fn selected_patch_preserves_missing_newline_and_escapes_terminal_controls() {
-        let document = Document::new("@@ -1 +1 @@\n-hello\n\\ No newline at end of file\n+hello\n");
-        let selected = document.selected_patch(0, 1).unwrap();
-        assert!(selected.contains("old:1 new:- -hello [no final newline]\n"));
-        assert!(selected.contains("old:- new:1 +hello\n"));
-        let document = Document::new("@@ -1 +1 @@\n-old\n+\u{1b}[31mtext\t中\n");
-        let selected = document.selected_patch(1, 1).unwrap();
-        assert!(!selected.contains('\u{1b}'));
-        assert!(selected.contains("\\u{1b}[31mtext\t中"));
-    }
-
-    #[test]
-    fn selected_patch_exports_loaded_context_with_original_coordinates() {
-        let mut document = Document::new("@@ -20 +20 @@\n-old\n+new\n");
-        let source = (1..=25)
-            .map(|line| {
-                if line == 20 {
-                    "new".into()
-                } else {
-                    format!("source{line}")
-                }
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
-        document.provide_context(source).unwrap();
-        document.toggle(0, false, false);
+        let fold = document.row_for_source(None, Some(2)).unwrap();
+        assert!(document.is_fold(fold));
+        assert_eq!(document.selected_line_range(0, last).unwrap(), (1, 100_000));
         assert_eq!(
-            document.selected_patch(0, 0).unwrap(),
-            "old:1 new:1  source1\n"
+            document.selected_line_range(fold, last).unwrap(),
+            (100_000, 100_000)
         );
-        let tail = document.row_for_source(None, Some(25)).unwrap();
-        assert!(document.is_fold(tail));
-        document.toggle(tail, true, false);
-        let last = document.row_for_source(None, Some(25)).unwrap();
-        assert_eq!(
-            document.selected_patch(last, last).unwrap(),
-            "old:25 new:25  source25 [no final newline]\n"
-        );
-    }
-
-    #[test]
-    fn selected_patch_rejects_oversized_source_ranges_and_long_lines() {
-        let mut patch = "--- /dev/null\n+++ b/new\n@@ -0,0 +1,2001 @@\n".to_string();
-        patch.push_str(&"+line\n".repeat(2_001));
-        let document = Document::new(&patch);
-        assert!(document.selected_patch(0, 1_999).is_ok());
-        assert!(document
-            .selected_patch(0, 2_000)
-            .unwrap_err()
-            .contains("2,000"));
-        let patch = format!(
-            "--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+{}\n",
-            "中".repeat(MAX_REVIEW_BYTES / 3 + 1)
-        );
-        let document = Document::new(&patch);
-        assert!(document
-            .selected_patch(0, 0)
-            .unwrap_err()
-            .contains("128 KiB"));
-        let patch = format!(
-            "--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+{}\n",
-            "\u{1b}".repeat(30_000)
-        );
-        assert!(Document::new(&patch)
-            .selected_patch(0, 0)
-            .unwrap_err()
-            .contains("128 KiB"));
+        assert!(document.selected_line_range(fold, fold).is_err());
+        assert!(Document::new("").selected_line_range(0, 0).is_err());
+        assert!(document.selected_line_range(0, usize::MAX).is_err());
     }
 
     #[test]

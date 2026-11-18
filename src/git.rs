@@ -90,42 +90,11 @@ impl FileStamp {
 }
 
 impl DiffSource {
-    /// Stable source context for a review selection; labels never need to be
-    /// reverse-parsed from the viewer's presentation title.
-    pub fn review_context(&self) -> String {
-        let (path, comparison) = match &self.request {
-            DiffRequest::Comparison { base, commit, path } => (
-                path,
-                if commit.is_empty() {
-                    format!("{}…HEAD (committed branch changes)", display_path(base))
-                } else {
-                    format!("commit {} (first-parent change)", display_path(commit))
-                },
-            ),
-            DiffRequest::Working { kind, path } => (
-                path,
-                match kind {
-                    ChangeKind::Unstaged => "index → worktree (unstaged)",
-                    ChangeKind::Staged => "HEAD → index (staged)",
-                    ChangeKind::Untracked => "empty → worktree (untracked)",
-                }
-                .into(),
-            ),
+    pub(crate) fn review_path(&self) -> String {
+        let path = match &self.request {
+            DiffRequest::Comparison { path, .. } | DiffRequest::Working { path, .. } => path,
         };
-        let mut context = format!(
-            "Repository: {}\nFile: {}\nComparison: {comparison}\n",
-            display_path(&self.repo.to_string_lossy()),
-            display_path(path),
-        );
-        let blob = match &self.content {
-            ContextSource::Blob(blob) => Some(blob),
-            ContextSource::Worktree { blob, .. } => blob.as_ref(),
-            _ => None,
-        };
-        if let Some(blob) = blob {
-            context.push_str(&format!("New-side blob: {}\n", display_path(blob)));
-        }
-        context
+        display_path(&self.repo.join(path).to_string_lossy())
     }
 
     /// A rewritten worktree file can retain exactly the same Git content while
@@ -1356,49 +1325,6 @@ fn parse_numstat(raw: &str) -> Result<Vec<FileStat>> {
         })
         .collect()
 }
-#[cfg(test)]
-mod review_context_tests {
-    use super::*;
-
-    #[test]
-    fn review_context_uses_source_paths_and_escapes_control_characters() {
-        let source = DiffSource {
-            repo: PathBuf::from("/tmp/repo\nname"),
-            request: DiffRequest::Working {
-                kind: ChangeKind::Staged,
-                path: "中文\tfile.rs".into(),
-            },
-            content: ContextSource::Blob("abc123".into()),
-        };
-        assert_eq!(source.review_context(), "Repository: /tmp/repo\\nname\nFile: 中文\\tfile.rs\nComparison: HEAD → index (staged)\nNew-side blob: abc123\n");
-    }
-
-    #[test]
-    fn review_context_distinguishes_branch_and_commit_comparisons() {
-        let mut source = DiffSource {
-            repo: PathBuf::from("/tmp/repo"),
-            request: DiffRequest::Comparison {
-                base: "origin/main".into(),
-                commit: String::new(),
-                path: "file.rs".into(),
-            },
-            content: ContextSource::Empty,
-        };
-        assert!(source
-            .review_context()
-            .contains("origin/main…HEAD (committed branch changes)"));
-        source.request = DiffRequest::Comparison {
-            base: String::new(),
-            commit: "abc123".into(),
-            path: "file.rs".into(),
-        };
-        assert!(source
-            .review_context()
-            .contains("commit abc123 (first-parent change)"));
-        assert!(!source.review_context().contains("origin/main"));
-    }
-}
-
 #[cfg(test)]
 mod graph_color_tests {
     use super::*;

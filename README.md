@@ -92,15 +92,15 @@ In either diff view, press `v` and move with arrows or `j` / `k` to select sourc
 for an agent. Shift-click can also extend that range when the terminal forwards it.
 Press `p` to choose an idle or done
 agent in the current workspace, then `Enter` or **Send** to paste the selection
-into its input. Review or edit it there and press Enter to submit. The text includes
-the repository, file, comparison, old/new line numbers and complete selected lines.
-Folded intervals are marked as omitted. Escape first cancels the target picker or
-selection, then returns from the inline diff to the file list.
+into its input as `/absolute/path/to/file.rs:L12-L18`. The first and last selected
+lines on the new side set the range. Deleted rows and fold markers are skipped
+when finding the endpoints. A selection needs at least one added or context line.
+Review or edit the location there and press Enter to submit. Escape first cancels
+the target picker or selection, then returns from the inline diff to the file list.
 
 While selecting or choosing a target, the diff snapshot stays stable across file
-updates. Selections are limited to 2,000 source lines and 128 KiB including context
-information. After an unconfirmed delivery, inspect the target's input and press
-`r` in the picker to reload targets before retrying.
+updates. After an unconfirmed delivery, inspect the target's input and press `r`
+in the picker to reload targets before retrying.
 
 ### Codex thread titles in the agent sidebar
 

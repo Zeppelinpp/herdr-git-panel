@@ -1,6 +1,6 @@
 //! Shared diff rendering and interaction for inline previews and popup views.
 use crate::{
-    diff::{Document, ExpandResult, PreparedContext, MAX_REVIEW_BYTES},
+    diff::{Document, ExpandResult, PreparedContext},
     git::DiffSource,
     host::DiffData,
     review::{Delivery, Progress},
@@ -136,20 +136,13 @@ impl Viewer {
     }
 
     fn selected_payload(&self) -> std::result::Result<String, String> {
-        let snippet = self
+        let (start, end) = self
             .doc
-            .selected_patch(self.selection.unwrap_or(self.cursor), self.cursor)?;
+            .selected_line_range(self.selection.unwrap_or(self.cursor), self.cursor)?;
         let source = self.source.as_ref().ok_or_else(|| {
             "Reopen this diff from the file list to include source information".to_string()
         })?;
-        let payload = format!(
-            "Selected diff lines\n{}\n\n{snippet}",
-            source.review_context()
-        );
-        if payload.len() > MAX_REVIEW_BYTES {
-            return Err("Selection exceeds 128 KiB; select fewer lines".into());
-        }
-        Ok(payload)
+        Ok(format!("{}:L{start}-L{end}", source.review_path()))
     }
 
     fn open_delivery(&mut self) {
@@ -814,11 +807,11 @@ mod tests {
         viewer.key(KeyEvent::from(KeyCode::Char('v')));
         viewer.key(KeyEvent::from(KeyCode::Down));
         viewer.horizontal = 200;
-        let text = viewer
+        let range = viewer
             .doc
-            .selected_patch(viewer.selection.unwrap(), viewer.cursor)
+            .selected_line_range(viewer.selection.unwrap(), viewer.cursor)
             .unwrap();
-        assert!(text.contains("-old31") && text.contains("+new31"));
+        assert_eq!(range, (31, 31));
         viewer.key(KeyEvent::from(KeyCode::Up));
         viewer.key(KeyEvent::from(KeyCode::Up));
         assert_eq!(viewer.selection, Some(start));
@@ -826,6 +819,34 @@ mod tests {
         assert!(!viewer.key(KeyEvent::from(KeyCode::Esc)));
         assert!(!viewer.review_active());
         assert!(viewer.key(KeyEvent::from(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn agent_payload_contains_only_the_file_path_and_selected_line_range() {
+        use crate::git::{ChangeKind, FileStat, Repo, WorkingFile};
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repo {
+            path: root.path().to_path_buf(),
+        };
+        let path = "中文 file.rs";
+        std::fs::write(root.path().join(path), "first\nsecond\nthird\n").unwrap();
+        let file = WorkingFile {
+            kind: ChangeKind::Untracked,
+            stat: FileStat {
+                path: path.into(),
+                added: "3".into(),
+                deleted: "0".into(),
+            },
+        };
+        let mut viewer = Viewer::new(repo.working_diff_data(&file).unwrap(), None);
+        viewer.key(KeyEvent::from(KeyCode::Down));
+        viewer.key(KeyEvent::from(KeyCode::Char('v')));
+        viewer.key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(
+            viewer.selected_payload().unwrap(),
+            format!("{}:L2-L3", root.path().join(path).display())
+        );
     }
 
     #[test]
@@ -856,8 +877,11 @@ mod tests {
         viewer.mouse(click(y + 3, KeyModifiers::SHIFT));
         assert_eq!(viewer.selection, Some(start));
         assert_eq!(viewer.cursor, start + 3);
-        let text = viewer.doc.selected_patch(start, viewer.cursor).unwrap();
-        assert!(text.contains("+new31") && text.contains("line33"));
+        let range = viewer
+            .doc
+            .selected_line_range(start, viewer.cursor)
+            .unwrap();
+        assert_eq!(range, (31, 33));
         assert_eq!(viewer.doc.len(), rows_before);
         assert!(viewer.loading.is_none());
 

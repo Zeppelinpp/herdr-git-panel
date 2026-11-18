@@ -186,7 +186,7 @@ fn delivery_uses_ready_workspace_agents_and_revalidates_before_pasting() {
 }
 
 fn payload() -> &'static str {
-    "Repository: /repo/中文\nFile: src/[x].rs\nold:12 new:12  let value = `literal`;\nold:- new:13 +\tprintln!(\"$(literal)\");\n"
+    "/repo/中文/src/[x] file.rs:L12-L13"
 }
 
 #[test]

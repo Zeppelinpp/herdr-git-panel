@@ -211,7 +211,7 @@ impl Delivery {
             height,
         );
         let block = Block::bordered()
-            .title("Paste selected diff to agent")
+            .title("Paste diff location to agent")
             .border_style(Style::new().fg(Color::Blue));
         let inner = block.inner(popup);
         frame.render_widget(Clear, popup);
