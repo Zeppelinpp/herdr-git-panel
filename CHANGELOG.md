@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.6] - 2026-11-18
+
+### Changed
+
+- Press `p` on a diff selection to paste its absolute file path and new-side line range into the chosen agent's input, for example `/repo/src/main.rs:L12-L18`.
+
+### Fixed
+
+- Place the cursor at the end of prefilled inputs, including PR and MR branch fields.
+- Keep the cursor and text visible when editing inputs containing wide characters.
+
+### Documentation
+
+- Explain how to display Codex thread titles in the Herdr agent sidebar.
+
 ## [0.7.5] - 2026-11-06
 
 ### Added
